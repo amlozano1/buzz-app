@@ -24,6 +24,7 @@ import { keypair, message, nativeSignatureChecks, signed } from "./testing";
 import { createOutbox, type OutgoingEvent, PublishRejected } from "./outbox";
 import { createMessages } from "./messages";
 import { createRelaySession } from "./session";
+import { nativeCommunityRequest } from "../communities/native-api";
 import {
   TEST_RECEIVING_ADDRESS,
   TEST_UPDATED_RECEIVING_ADDRESS,
@@ -129,6 +130,90 @@ it("updates receiving through the native profile publisher, verifies readback, a
     store.dispose();
   }
 });
+it("rejects a changed profile after signing and excludes overlapping native profile writers", async () => {
+  const original = signed(viewer, {
+    kind: 0,
+    tags: [],
+    content: JSON.stringify({ name: "Before" }),
+  });
+  let head = original;
+  respond = (request) => {
+    if (request.path === "/query") return { body: [head] };
+    if (request.path === "/events") {
+      assert(request.body);
+      head = JSON.parse(request.body);
+      return { body: { accepted: true, event_id: head.id } };
+    }
+    return { body: [] };
+  };
+  const transport = await connectNativeTransport(community);
+  const started = deferred<void>(),
+    gate = deferred<void>();
+  const implementation = vi.mocked(invoke).getMockImplementation();
+  assert(implementation);
+  assert(transport.updateReceivingAddress);
+  vi.mocked(invoke).mockImplementation(async (command, args, options) => {
+    if (command === "relay_sign") {
+      started.resolve();
+      await gate.promise;
+    }
+    return implementation(command, args, options);
+  });
+  const signal = new AbortController().signal;
+  const saving = transport.updateReceivingAddress(
+    TEST_RECEIVING_ADDRESS,
+    original,
+    signal,
+  );
+  const rejected = expect(saving).rejects.toThrow("profile changed");
+  try {
+    await started.promise;
+    await expect(
+      transport.updateReceivingAddress(
+        TEST_UPDATED_RECEIVING_ADDRESS,
+        original,
+        signal,
+      ),
+    ).rejects.toThrow("already in progress");
+    await expect(
+      nativeCommunityRequest(
+        community,
+        "profile",
+        { name: "Editor", picture: "", existing: {} },
+        signal,
+      ),
+    ).rejects.toThrow("already in progress");
+    head = signed(viewer, {
+      kind: 0,
+      tags: [],
+      created_at: original.created_at + 1,
+      content: JSON.stringify({ name: "After", custom: "keep" }),
+    });
+    gate.resolve();
+    await rejected;
+    expect(
+      requests.filter((request) => request.path === "/events"),
+    ).toHaveLength(0);
+    // Failure releases ownership; an explicit new save uses the new metadata.
+    await transport.updateReceivingAddress(
+      TEST_RECEIVING_ADDRESS,
+      head,
+      signal,
+    );
+    expect(JSON.parse(head.content)).toEqual({
+      name: "After",
+      custom: "keep",
+      lud16: TEST_RECEIVING_ADDRESS,
+    });
+    expect(
+      requests.filter((request) => request.path === "/events"),
+    ).toHaveLength(1);
+  } finally {
+    gate.resolve();
+    await saving.catch(() => {});
+  }
+});
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {

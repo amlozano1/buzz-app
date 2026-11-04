@@ -1,6 +1,11 @@
 import { isSidebarPreferencesBatch } from "../src/features/relay/sidebar-preferences.ts";
 import { receivingProfileTemplate } from "../src/features/communities/receiving-profile.ts";
 import {
+  assertReceivingProfileHead,
+  receivingProfileFilter,
+  reserveProfilePublication,
+} from "../src/features/communities/profile-publication.ts";
+import {
   isCatalogKind,
   MAX_EVENT_BYTES as CATALOG_EVENT_BYTES,
   validCatalogEnvelope,
@@ -974,6 +979,7 @@ export function relayBrokerPlugin({
         const url = new URL(req.url, origin);
         // Own cancellation before awaiting the request body, signing or dispatch.
         const cancel = new AbortController();
+        let releaseProfile;
         const release = () => cancel.abort();
         res.once("close", release);
         if (res.destroyed) release();
@@ -2716,6 +2722,14 @@ export function relayBrokerPlugin({
               ...(filters.page === undefined ? {} : { page: filters.page }),
             };
           }
+          const receivingBase = receiving ? filters?.profile?.id : undefined;
+          if (profile) {
+            try {
+              releaseProfile = reserveProfilePublication(relay, viewer);
+            } catch (error) {
+              return json(res, 409, { error: error.message, sent: false });
+            }
+          }
           if (receiving) {
             try {
               filters = finalizeEvent(
@@ -3144,13 +3158,14 @@ export function relayBrokerPlugin({
             const admissionStart = performance.now();
             let connectsBefore, upstreamStart;
             let response;
+            const upstreamDeadline = AbortSignal.timeout(
+              presence || memory ? 10000 : UPSTREAM_TIMEOUT_MS,
+            );
             const requestSignal = AbortSignal.any([
               cancel.signal,
-              AbortSignal.timeout(
-                presence || memory ? 10000 : UPSTREAM_TIMEOUT_MS,
-              ),
+              upstreamDeadline,
             ]);
-            const request = () => {
+            const request = (path = upstreamPath, payload = body) => {
               // Auth freshness and network timings begin at dispatch, not queue entry.
               requestSignal.throwIfAborted();
               timings.push(
@@ -3163,14 +3178,14 @@ export function relayBrokerPlugin({
                   created_at: Math.floor(Date.now() / 1000),
                   content: "",
                   tags: [
-                    ["u", `${relay}${upstreamPath}`],
+                    ["u", `${relay}${path}`],
                     ["method", method],
-                    ...(body === undefined
+                    ...(payload === undefined
                       ? []
                       : [
                           [
                             "payload",
-                            createHash("sha256").update(body).digest("hex"),
+                            createHash("sha256").update(payload).digest("hex"),
                           ],
                         ]),
                     ["nonce", randomBytes(16).toString("hex")],
@@ -3183,7 +3198,7 @@ export function relayBrokerPlugin({
               );
               connectsBefore = upstream.connects();
               upstreamStart = performance.now();
-              return fetchUpstream(`${relay}${upstreamPath}`, {
+              return fetchUpstream(`${relay}${path}`, {
                 method,
                 headers: {
                   "Content-Type": "application/json",
@@ -3191,9 +3206,14 @@ export function relayBrokerPlugin({
                     "Nostr " +
                     Buffer.from(JSON.stringify(auth)).toString("base64"),
                 },
-                body,
+                body: payload,
                 redirect: "error",
-                signal: requestSignal,
+                // Once sent, retain profile ownership until upstream settles:
+                // a closed browser cannot cancel a relay-side commit.
+                signal:
+                  profile && path === "/events"
+                    ? upstreamDeadline
+                    : requestSignal,
               }).then((response) => {
                 timings.push(
                   `ttfb;dur=${(performance.now() - upstreamStart).toFixed(2)}`,
@@ -3201,6 +3221,31 @@ export function relayBrokerPlugin({
                 return response;
               });
             };
+            if (receiving) {
+              const current = await admittedApiRequest(
+                lane,
+                () =>
+                  request(
+                    "/query",
+                    JSON.stringify(receivingProfileFilter(viewer)),
+                  ),
+                requestSignal,
+              );
+              if (!current.ok)
+                return json(res, current.status, {
+                  error: "Current profile could not be checked",
+                  sent: false,
+                });
+              try {
+                assertReceivingProfileHead(
+                  await current.json(),
+                  viewer,
+                  receivingBase,
+                );
+              } catch (error) {
+                return json(res, 409, { error: error.message, sent: false });
+              }
+            }
             response = presence
               ? await request()
               : await admittedApiRequest(
@@ -3327,6 +3372,7 @@ export function relayBrokerPlugin({
             return json(res, 502, { error: "Relay unreachable", sent: false });
           json(res, 500, { error: "Local relay broker failed" });
         } finally {
+          releaseProfile?.();
           res.off("close", release);
         }
       });

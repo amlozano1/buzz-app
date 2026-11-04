@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { assert, expect, it } from "vitest";
 import { createRelaySession } from "./session";
 import { keypair, signed, scriptedTransport } from "./testing";
 import { receivingProfileTemplate } from "../communities/receiving-profile";
@@ -24,6 +24,7 @@ it("publishes once through the narrow writer and updates the shared profile only
       viewer,
       receivingProfileTemplate({ address, profile }, viewer.pubkey),
     );
+    return head.id;
   };
   const store = createRelaySession({
     ...wire.transport,
@@ -63,6 +64,7 @@ it("does not retry publication or accept an unconfirmed readback, and fences dis
   const updateReceivingAddress = async () => {
     sends++;
     if (fail) throw new Error("Unconfirmed publication");
+    return "a".repeat(64);
   };
   const store = createRelaySession({
     ...wire.transport,
@@ -100,7 +102,7 @@ it("does not advertise profile writes on older or cached transports", () => {
   const wire = scriptedTransport(keypair().pubkey, keypair().pubkey);
   const old = createRelaySession(wire.transport);
   const cached = createRelaySession(
-    { ...wire.transport, updateReceivingAddress: async () => {} },
+    { ...wire.transport, updateReceivingAddress: async () => "a".repeat(64) },
     { cachedOnly: true },
   );
   try {
@@ -111,3 +113,103 @@ it("does not advertise profile writes on older or cached transports", () => {
     cached.dispose();
   }
 });
+
+it("keeps strong profile reads alive across channel discovery", async () => {
+  const viewer = keypair();
+  const wire = scriptedTransport(viewer.pubkey, keypair().pubkey);
+  let head = signed(viewer, {
+    kind: 0,
+    tags: [],
+    content: JSON.stringify({ name: "Sam" }),
+  });
+  let entered!: () => void, release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  wire.transport.query = async (filters) => {
+    if (!filters.some((filter) => filter.kinds?.includes(0))) return [];
+    entered();
+    await gate;
+    return [head];
+  };
+  let sends = 0;
+  const store = createRelaySession({
+    ...wire.transport,
+    updateReceivingAddress: async (address, profile) => {
+      sends++;
+      head = signed(
+        viewer,
+        receivingProfileTemplate({ address, profile }, viewer.pubkey),
+      );
+      return head.id;
+    },
+  });
+  assert(store.session.receivingAddress);
+  const saving = store.session.receivingAddress.update(
+    TEST_RECEIVING_ADDRESS,
+    new AbortController().signal,
+  );
+  // Observe rejection immediately even if discovery fails before the final assertion.
+  void saving.catch(() => {});
+  try {
+    await started;
+    assert(store.session.channels.refreshList);
+    await store.session.channels.refreshList();
+    release();
+    await expect(saving).resolves.toBe(TEST_RECEIVING_ADDRESS);
+    expect(sends).toBe(1);
+  } finally {
+    release();
+    store.dispose();
+    await saving.catch(() => {});
+  }
+});
+
+it.each(["older", "superseding"])(
+  "rejects a %s readback even when its address matches",
+  async (version) => {
+    const viewer = keypair();
+    const wire = scriptedTransport(viewer.pubkey, keypair().pubkey);
+    const old = signed(viewer, {
+      kind: 0,
+      tags: [],
+      content: JSON.stringify({
+        name: "Sam",
+        lud16: TEST_RECEIVING_ADDRESS,
+        lud06: "legacy",
+      }),
+    });
+    let head = old;
+    wire.transport.query = async () => [head];
+    const store = createRelaySession({
+      ...wire.transport,
+      updateReceivingAddress: async (address, profile) => {
+        const published = signed(
+          viewer,
+          receivingProfileTemplate({ address, profile }, viewer.pubkey),
+        );
+        if (version === "superseding")
+          head = signed(viewer, {
+            ...published,
+            created_at: published.created_at + 1,
+            content: JSON.stringify({ name: "Changed", lud16: address }),
+          });
+        return published.id;
+      },
+    });
+    try {
+      await expect(
+        store.session.receivingAddress?.update(
+          TEST_RECEIVING_ADDRESS,
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow("not been confirmed");
+      expect(store.session.profiles.event?.(viewer.pubkey)?.id).toBe(head.id);
+    } finally {
+      store.dispose();
+    }
+  },
+);

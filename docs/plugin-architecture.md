@@ -1814,8 +1814,13 @@ On supporting hosts, `session.receivingAddress.update(address, signal)` updates
 the signed-in person's Lightning receiving address (`lud16`) in the current
 community. Feature-detect this optional capability. It reads the current verified
 profile, preserves other metadata and tags, removes the obsolete `lud06`, and
-requires an exact publication receipt followed by verified relay readback. It
-publishes once and never retries a write. Bind the call to the ready session's
+requires an exact publication receipt followed by verified readback of that same
+event as the current profile head. A superseding head is unconfirmed even if its
+address matches. Each host runtime rejects overlapping profile publications and
+rechecks the signed base after signing, before sending. An observed change fails
+without publication. This is not relay-side compare-and-swap: another device can
+still write between the final check and publication. It publishes once and never
+retries a write. Bind the call to the ready session's
 lifetime; a cancelled or unconfirmed call may have reached the relay, so inspect
 the profile before trying again. Cached sessions do not offer it. The host keeps
 signing inside its native/broker profile publisher; kind 0 remains unavailable

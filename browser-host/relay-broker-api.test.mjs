@@ -214,12 +214,175 @@ test("receiving-address host route signs only an own profile patch, confirms rea
       (
         await h.post("receiving-address", {
           address: TEST_RECEIVING_ADDRESS,
-          profile,
+          profile: head,
         })
       ).status,
     ).toBe(502);
   } finally {
     store?.dispose();
+    await h.close();
+  }
+});
+
+test("receiving preflight rejects changed heads and excludes overlapping broker profile writers", async () => {
+  const key = new Uint8Array(32);
+  key[31] = 7;
+  const original = finalizeEvent(
+    {
+      kind: 0,
+      created_at: 1699999998,
+      tags: [],
+      content: JSON.stringify({ name: "Before" }),
+    },
+    key,
+  );
+  let head = original;
+  let entered, release;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const h = await harness(async (call) => {
+    if (call.url.endsWith("/query")) {
+      expect(call.body).toEqual([
+        {
+          kinds: [0],
+          authors: [original.pubkey],
+          limit: 5,
+          consistency: "strong",
+        },
+      ]);
+      entered();
+      await gate;
+      return Response.json([head]);
+    }
+    if (call.url.endsWith("/events")) head = call.body;
+    return Response.json({ accepted: true, event_id: call.body.id });
+  });
+  const saving = h.post("receiving-address", {
+    address: TEST_RECEIVING_ADDRESS,
+    profile: original,
+  });
+  try {
+    await started;
+    for (const [route, body] of [
+      [
+        "receiving-address",
+        { address: TEST_RECEIVING_ADDRESS, profile: original },
+      ],
+      ["profile", { name: "Editor", picture: "", existing: {} }],
+    ]) {
+      const response = await h.post(route, body);
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        sent: false,
+        error: expect.stringContaining("already in progress"),
+      });
+    }
+    head = finalizeEvent(
+      {
+        kind: 0,
+        created_at: 1699999999,
+        tags: [],
+        content: JSON.stringify({ name: "After", custom: "keep" }),
+      },
+      key,
+    );
+    release();
+    const response = await saving;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      sent: false,
+      error: expect.stringContaining("profile changed"),
+    });
+    expect(h.calls.filter((call) => call.url.endsWith("/events"))).toHaveLength(
+      0,
+    );
+    const retry = await h.post("receiving-address", {
+      address: TEST_RECEIVING_ADDRESS,
+      profile: head,
+    });
+    expect(retry.status).toBe(200);
+    expect(JSON.parse(head.content)).toEqual({
+      name: "After",
+      custom: "keep",
+      lud16: TEST_RECEIVING_ADDRESS,
+    });
+  } finally {
+    release();
+    await saving.catch(() => {});
+    await h.close();
+  }
+});
+
+test("a cancelled browser save retains profile ownership until its dispatched write settles", async () => {
+  const key = new Uint8Array(32);
+  key[31] = 7;
+  let head = finalizeEvent(
+    {
+      kind: 0,
+      created_at: 1699999998,
+      tags: [],
+      content: JSON.stringify({ name: "Sam" }),
+    },
+    key,
+  );
+  let entered, release, upstreamSignal;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const h = await harness(async (call) => {
+    if (call.url.endsWith("/query")) return Response.json([head]);
+    upstreamSignal = call.signal;
+    entered();
+    await gate;
+    head = call.body;
+    return Response.json({ accepted: true, event_id: head.id });
+  });
+  const controller = new AbortController();
+  const responses = [];
+  h.server.on("request", (_request, response) => responses.push(response));
+  const saving = h.post(
+    "receiving-address",
+    { address: TEST_RECEIVING_ADDRESS, profile: head },
+    controller.signal,
+  );
+  const rejected = expect(saving).rejects.toThrow();
+  try {
+    await started;
+    // Observe the broker receiving the cancellation before attempting another write.
+    const closed = new Promise((resolve) => {
+      for (const response of responses) response.once("close", resolve);
+    });
+    controller.abort();
+    await rejected;
+    await closed;
+    expect(upstreamSignal.aborted).toBe(false);
+    const overlap = await h.post("receiving-address", {
+      address: TEST_RECEIVING_ADDRESS,
+      profile: head,
+    });
+    expect(overlap.status).toBe(409);
+    expect(h.calls.filter((call) => call.url.endsWith("/events"))).toHaveLength(
+      1,
+    );
+    release();
+    await expect
+      .poll(async () => (await (await h.get("stats")).json()).queries)
+      .toBe(1);
+    const next = await h.post("receiving-address", {
+      address: TEST_RECEIVING_ADDRESS,
+      profile: head,
+    });
+    expect(next.status).toBe(200);
+  } finally {
+    release();
+    await saving.catch(() => {});
     await h.close();
   }
 });

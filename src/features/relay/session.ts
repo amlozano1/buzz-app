@@ -162,7 +162,7 @@ function isProfileFilter(filter: ReadFilter) {
     filter.kinds[0] === 0 &&
     !!filter.authors?.length &&
     Object.keys(filter).every((key) =>
-      ["kinds", "authors", "limit"].includes(key),
+      ["kinds", "authors", "limit", "consistency"].includes(key),
     )
   );
 }
@@ -2629,11 +2629,15 @@ export function createRelaySession(
               const publish = transport.updateReceivingAddress;
               if (!publish)
                 throw new Error("Receiving address updates unavailable");
-              await publish(address, profile, bound);
+              const publishedId = await publish(address, profile, bound);
               bound.throwIfAborted();
               const saved = await readHead();
               bound.throwIfAborted();
-              if (!saved || JSON.parse(saved.content).lud16 !== address.trim())
+              if (
+                !saved ||
+                saved.id !== publishedId ||
+                JSON.parse(saved.content).lud16 !== address.trim()
+              )
                 throw new Error(
                   "Receiving address has not been confirmed by the relay. Check your profile before saving again.",
                 );

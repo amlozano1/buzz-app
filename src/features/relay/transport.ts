@@ -89,12 +89,13 @@ export interface RelayWriter {
   ): Promise<string> | Promise<void>;
 }
 export interface ReadTransport {
-  /** Updates only lud16 on an existing own signed profile. No arbitrary signer. */
+  /** Patches an own signed profile after a fresh head check. Returns the exact
+   * accepted event ID for readback. No arbitrary signer or automatic retry. */
   readonly updateReceivingAddress?: (
     address: string,
     profile: RelayEvent,
     signal: AbortSignal,
-  ) => Promise<void>;
+  ) => Promise<string>;
   readonly artifactIncremental?: ArtifactIncrementalReader;
   readonly projectGit?: RepoGit;
   readonly readAgentMemories?: MemoryReader;
@@ -617,6 +618,7 @@ export async function connectBrokerTransport(
               throw new Error(
                 "Receiving profile publication was not confirmed",
               );
+            return receipt.event_id as string;
           },
         }
       : {}),

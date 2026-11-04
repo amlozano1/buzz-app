@@ -15,6 +15,7 @@ import { eventDto } from "../relay/events";
 import { readApiFailure } from "../relay/http-admission";
 import { admitSignedRequest } from "../relay/transport";
 import type { PersonalProfile } from "./service";
+import { reserveProfilePublication } from "./profile-publication";
 
 export async function nativeCommunityRequest(
   community: string,
@@ -191,18 +192,28 @@ export async function nativeCommunityRequest(
     });
     if (new TextEncoder().encode(content).length > 16000)
       throw new Error("Profile too large");
-    const event = await nativeRelaySigner(community).signEvent({
-      kind: 0,
-      created_at: Math.floor(Date.now() / 1000),
-      tags: [],
-      content,
-    });
-    const result = await readResponse(
-      await nativeRelayRequest(community, "/events", event, signal),
+    const signer = nativeRelaySigner(community);
+    const release = reserveProfilePublication(
+      communityDestination(community).url,
+      await signer.getPublicKey(),
     );
-    if (result.event_id !== event.id || result.accepted !== true)
-      throw new Error("Profile publication was not confirmed");
-    return result;
+    try {
+      signal.throwIfAborted();
+      const event = await signer.signEvent({
+        kind: 0,
+        created_at: Math.floor(Date.now() / 1000),
+        tags: [],
+        content,
+      });
+      const result = await readResponse(
+        await nativeRelayRequest(community, "/events", event, signal),
+      );
+      if (result.event_id !== event.id || result.accepted !== true)
+        throw new Error("Profile publication was not confirmed");
+      return result;
+    } finally {
+      release();
+    }
   }
   if (route === "member") {
     // The relay decides each change; only its allowed refusals come back verbatim.
