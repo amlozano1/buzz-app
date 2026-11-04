@@ -64,6 +64,67 @@ const cancels: string[] = [];
 let hangUploads = false;
 let preparedResponse: (() => { status?: number; body: unknown }) | undefined;
 const owners: ReturnType<typeof createOutbox>[] = [];
+
+it("updates receiving through the native profile publisher, verifies readback, and rejects a mismatched receipt", async () => {
+  let profile = signed(viewer, {
+    kind: 0,
+    tags: [["keep", "tag"]],
+    created_at: 1700000000,
+    content: JSON.stringify({
+      name: "Sam",
+      display_name: "Different",
+      about: "Keep bio",
+      lud06: "old",
+    }),
+  });
+  let confirm = true;
+  respond = (request) => {
+    if (request.path === "/query") return { body: [profile] };
+    if (request.path === "/events") {
+      profile = JSON.parse(request.body ?? "null");
+      return {
+        body: { accepted: true, event_id: confirm ? profile.id : "unrelated" },
+      };
+    }
+    return { body: [] };
+  };
+  const transport = await connectNativeTransport(community);
+  const store = createRelaySession(transport);
+  try {
+    expect(store.session.outbox?.supports(0)).toBe(false);
+    await expect(
+      store.session.receivingAddress?.update(
+        "sam@lexe.app",
+        new AbortController().signal,
+      ),
+    ).resolves.toBe("sam@lexe.app");
+    expect(verifyEvent(profile)).toBe(true);
+    expect(profile.pubkey).toBe(viewer.pubkey);
+    expect(profile.tags).toEqual([["keep", "tag"]]);
+    expect(
+      JSON.parse(
+        store.session.profiles.event?.(viewer.pubkey)?.content ?? "null",
+      ),
+    ).toEqual({
+      name: "Sam",
+      display_name: "Different",
+      about: "Keep bio",
+      lud16: "sam@lexe.app",
+    });
+    confirm = false;
+    await expect(
+      store.session.receivingAddress?.update(
+        "sam2@lexe.app",
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("not confirmed");
+    expect(
+      requests.filter((request) => request.path === "/events"),
+    ).toHaveLength(2);
+  } finally {
+    store.dispose();
+  }
+});
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => {

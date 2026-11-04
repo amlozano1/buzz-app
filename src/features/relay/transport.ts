@@ -89,6 +89,12 @@ export interface RelayWriter {
   ): Promise<string> | Promise<void>;
 }
 export interface ReadTransport {
+  /** Updates only lud16 on an existing own signed profile. No arbitrary signer. */
+  readonly updateReceivingAddress?: (
+    address: string,
+    profile: RelayEvent,
+    signal: AbortSignal,
+  ) => Promise<void>;
   readonly artifactIncremental?: ArtifactIncrementalReader;
   readonly projectGit?: RepoGit;
   readonly readAgentMemories?: MemoryReader;
@@ -486,6 +492,7 @@ export async function connectBrokerTransport(
     projectGit?: boolean;
     attachmentUploads?: boolean;
     directMessages?: boolean;
+    receivingAddress?: boolean;
     channelLifecycle?: boolean;
     channelDetails?: boolean;
     memberAdministration?: boolean;
@@ -586,6 +593,33 @@ export async function connectBrokerTransport(
   });
   return {
     profiling,
+    ...(session.receivingAddress === true
+      ? {
+          async updateReceivingAddress(
+            address: string,
+            profile: RelayEvent,
+            signal: AbortSignal,
+          ) {
+            const response = await fetch(`${endpoint}/receiving-address`, {
+              method: "POST",
+              credentials: "same-origin",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ address, profile }),
+              signal,
+            });
+            if (!response.ok)
+              throw new Error((await readApiFailure(response)).error);
+            const receipt = await response.json();
+            if (
+              receipt.accepted !== true ||
+              !/^[a-f0-9]{64}$/.test(receipt.event_id)
+            )
+              throw new Error(
+                "Receiving profile publication was not confirmed",
+              );
+          },
+        }
+      : {}),
     ...(session.attachmentUploads === true && session.relayUrl
       ? { uploadAttachment: brokerUpload(endpoint, session.relayUrl) }
       : {}),

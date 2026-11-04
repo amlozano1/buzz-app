@@ -8,6 +8,7 @@ import {
   verifiedProfileDiscovery,
 } from "./verified-profile";
 import { nativeSocket } from "./native-socket";
+import { receivingProfileTemplate } from "../communities/receiving-profile";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { EventTemplate } from "nostr-tools";
 import { communityDestination, relayOrigin } from "../communities/destination";
@@ -841,6 +842,24 @@ export async function connectNativeTransport(
     ...(searchSort ? { searchSort: true as const } : {}),
     ...(artifactSync ? { artifactSync: true as const } : {}),
     verifiedProfiles: verifiedProfileAuthority(info),
+    async updateReceivingAddress(address, profile, signal) {
+      signal.throwIfAborted();
+      const event = await nativeRelaySigner(origin).signEvent(
+        receivingProfileTemplate({ address, profile }, transport.viewer),
+      );
+      signal.throwIfAborted();
+      const response = await nativeRelayRequest(
+        origin,
+        "/events",
+        event,
+        signal,
+      );
+      signal.throwIfAborted();
+      if (!response.ok) throw new Error((await readApiFailure(response)).error);
+      const receipt = await response.json();
+      if (receipt.accepted !== true || receipt.event_id !== event.id)
+        throw new Error("Receiving profile publication was not confirmed");
+    },
     async readVerifiedProfileAuthority(signal) {
       return verifiedProfileDiscovery(await nativeRelayInfo(origin, signal));
     },

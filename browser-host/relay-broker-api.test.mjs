@@ -144,6 +144,78 @@ async function harness(
 const blob = "c".repeat(64);
 const filters = [{ kinds: [0], limit: 1 }];
 
+test("receiving-address host route signs only an own profile patch, confirms readback, and checks the exact receipt", async () => {
+  const key = new Uint8Array(32);
+  key[31] = 7;
+  const viewer = getPublicKey(key);
+  const profile = finalizeEvent(
+    {
+      kind: 0,
+      created_at: 1699999999,
+      tags: [["keep", "tag"]],
+      content: JSON.stringify({
+        name: "Sam",
+        display_name: "Different",
+        about: "Keep bio",
+        lud06: "old",
+      }),
+    },
+    key,
+  );
+  let head = profile,
+    confirm = true;
+  const h = await harness((call) => {
+    if (call.url.endsWith("/query")) return Response.json([head]);
+    if (call.url.endsWith("/events")) head = call.body;
+    return Response.json({
+      accepted: true,
+      event_id: confirm ? call.body.id : "unrelated",
+    });
+  });
+  let store;
+  try {
+    expect((await (await h.get("session")).json()).receivingAddress).toBe(true);
+    store = createRelaySession(await connectBrokerTransport(h.base));
+    expect(store.session.outbox?.supports(0)).toBe(false);
+    await expect(
+      store.session.receivingAddress?.update(
+        "sam@lexe.app",
+        new AbortController().signal,
+      ),
+    ).resolves.toBe("sam@lexe.app");
+    const published = h.calls.findLast((call) =>
+      call.url.endsWith("/events"),
+    ).body;
+    expect(verifyEvent(published)).toBe(true);
+    expect(published.pubkey).toBe(viewer);
+    expect(published.tags).toEqual(profile.tags);
+    expect(JSON.parse(published.content)).toEqual({
+      name: "Sam",
+      display_name: "Different",
+      about: "Keep bio",
+      lud16: "sam@lexe.app",
+    });
+    expect(store.session.profiles.event(viewer).id).toBe(published.id);
+    expect(published.created_at).toBeGreaterThan(profile.created_at);
+    const before = h.calls.length;
+    for (const body of [
+      { address: "bad", profile },
+      { address: "sam@lexe.app", profile: { ...profile, content: "{}" } },
+      { address: "sam@lexe.app", profile, content: "{}" },
+    ])
+      expect((await h.post("receiving-address", body)).status).toBe(400);
+    expect(h.calls.length).toBe(before);
+    confirm = false;
+    expect(
+      (await h.post("receiving-address", { address: "sam@lexe.app", profile }))
+        .status,
+    ).toBe(502);
+  } finally {
+    store?.dispose();
+    await h.close();
+  }
+});
+
 test.each([
   [202, { status: "aborted" }],
   [409, { error: { code: "must_archive" } }],

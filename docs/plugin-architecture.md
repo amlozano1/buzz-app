@@ -1810,6 +1810,18 @@ For kind 30177 publication, follow the
 [managed-agent registration guidance](relay-queries.md#managed-agent-registration-kind-30177).
 
 The [Profiles plugin](profiles.md) supplies read-only human/agent identity panels.
+On supporting hosts, `session.receivingAddress.update(address, signal)` updates
+the signed-in person's Lightning receiving address (`lud16`) in the current
+community. Feature-detect this optional capability. It reads the current verified
+profile, preserves other metadata and tags, removes the obsolete `lud06`, and
+requires an exact publication receipt followed by verified relay readback. It
+publishes once and never retries a write. Bind the call to the ready session's
+lifetime; a cancelled or unconfirmed call may have reached the relay, so inspect
+the profile before trying again. Cached sessions do not offer it. The host keeps
+signing inside its native/broker profile publisher; kind 0 remains unavailable
+through the general message outbox. Updating an address grants no spending access
+and does not prove that a Lightning provider can receive a payment.
+
 Shared message UI opens exact public-key targets through ordinary page callbacks;
 no inline-renderer or panel contract extension is needed.
 

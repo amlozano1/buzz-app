@@ -1,4 +1,5 @@
 import { isSidebarPreferencesBatch } from "../src/features/relay/sidebar-preferences.ts";
+import { receivingProfileTemplate } from "../src/features/communities/receiving-profile.ts";
 import {
   isCatalogKind,
   MAX_EVENT_BYTES as CATALOG_EVENT_BYTES,
@@ -1562,6 +1563,7 @@ export function relayBrokerPlugin({
               // Display base for relay HTTP routes such as /hooks/{workflow_id}.
               relayHttpUrl: relay,
               directMessages: true,
+              receivingAddress: true,
               writeKinds: [
                 30315,
                 30030,
@@ -2326,6 +2328,7 @@ export function relayBrokerPlugin({
               "/api/relay/channel-kit-prepare",
               "/api/relay/read-state-publish",
               "/api/relay/profile",
+              "/api/relay/receiving-address",
               "/api/relay/direct-message",
               "/api/relay/agent-log-proof",
               "/api/relay/git-authorization",
@@ -2630,7 +2633,8 @@ export function relayBrokerPlugin({
           const channelActivity = route === "/api/relay/channel-activity";
           if (channelActivity && !validChannelActivityFilters(filters))
             return json(res, 400, { error: "Activity filter rejected" });
-          const profile = route === "/api/relay/profile";
+          const receiving = route === "/api/relay/receiving-address";
+          const profile = receiving || route === "/api/relay/profile";
           const directMessage = route === "/api/relay/direct-message";
           if (directMessage) {
             try {
@@ -2712,7 +2716,19 @@ export function relayBrokerPlugin({
               ...(filters.page === undefined ? {} : { page: filters.page }),
             };
           }
-          if (profile) {
+          if (receiving) {
+            try {
+              filters = finalizeEvent(
+                receivingProfileTemplate(filters, viewer),
+                key,
+              );
+            } catch {
+              return json(res, 400, {
+                error: "Receiving address update rejected",
+                sent: false,
+              });
+            }
+          } else if (profile) {
             if (
               typeof filters?.name !== "string" ||
               !filters.name.trim() ||
