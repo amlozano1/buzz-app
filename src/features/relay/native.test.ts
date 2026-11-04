@@ -25,6 +25,7 @@ import { createOutbox, type OutgoingEvent, PublishRejected } from "./outbox";
 import { createMessages } from "./messages";
 import { createRelaySession } from "./session";
 import { nativeCommunityRequest } from "../communities/native-api";
+import { newer } from "./events";
 import {
   TEST_RECEIVING_ADDRESS,
   TEST_UPDATED_RECEIVING_ADDRESS,
@@ -211,6 +212,177 @@ it("rejects a changed profile after signing and excludes overlapping native prof
   } finally {
     gate.resolve();
     await saving.catch(() => {});
+  }
+});
+
+it.each(["failure", "cancel"])(
+  "an editor preflight %s sends no profile and releases native ownership",
+  async (outcome) => {
+    const started = deferred<void>(),
+      gate = deferred<void>();
+    let first = true;
+    respond = async (request) => {
+      if (first) {
+        first = false;
+        started.resolve();
+        await gate.promise;
+        return outcome === "cancel" ? { body: [] } : { status: 503, body: {} };
+      }
+      if (request.path === "/query") return { body: [] };
+      return {
+        body: {
+          accepted: true,
+          event_id: JSON.parse(request.body ?? "null").id,
+        },
+      };
+    };
+    const controller = new AbortController();
+    const saving = nativeCommunityRequest(
+      community,
+      "profile",
+      { name: "Editor", picture: "" },
+      controller.signal,
+    );
+    const rejected = expect(saving).rejects.toThrow();
+    try {
+      await started.promise;
+      await expect(
+        nativeCommunityRequest(community, "profile", {
+          name: "Overlap",
+          picture: "",
+        }),
+      ).rejects.toThrow("already in progress");
+      if (outcome === "cancel") controller.abort();
+      gate.resolve();
+      await rejected;
+      expect(requests.map((request) => request.path)).toEqual(["/query"]);
+      expect(
+        vi
+          .mocked(invoke)
+          .mock.calls.some(([command]) => command === "relay_sign"),
+      ).toBe(false);
+      await nativeCommunityRequest(community, "profile", {
+        name: "Retry",
+        picture: "",
+      });
+      expect(requests.map((request) => request.path)).toEqual([
+        "/query",
+        "/query",
+        "/events",
+      ]);
+    } finally {
+      gate.resolve();
+      await saving.catch(() => {});
+    }
+  },
+);
+
+it.each([undefined, TEST_UPDATED_RECEIVING_ADDRESS])(
+  "preserves the saved receiving address after a delayed editor read (previous: %s)",
+  async (previousAddress) => {
+    const original = signed(viewer, {
+      kind: 0,
+      tags: [["keep", "tag"]],
+      content: JSON.stringify({
+        name: "Before",
+        custom: "keep",
+        lud16: previousAddress,
+      }),
+    });
+    let head = original;
+    const started = deferred<void>(),
+      gate = deferred<void>();
+    let holdEditorRead = true;
+    respond = async (request) => {
+      if (request.path === "/query") {
+        if (holdEditorRead) {
+          holdEditorRead = false;
+          started.resolve();
+          await gate.promise;
+          return { body: [original] };
+        }
+        return { body: [head] };
+      }
+      assert(request.body);
+      const event = JSON.parse(request.body);
+      head = newer(head, event);
+      return { body: { accepted: head.id === event.id, event_id: event.id } };
+    };
+    const transport = await connectNativeTransport(community);
+    const store = createRelaySession(transport);
+    const editorRead = transport.query([
+      { kinds: [0], authors: [viewer.pubkey], limit: 5, consistency: "strong" },
+    ]);
+    try {
+      await started.promise;
+      await store.session.receivingAddress?.update(
+        TEST_RECEIVING_ADDRESS,
+        new AbortController().signal,
+      );
+      expect(JSON.parse(head.content).lud16).toBe(TEST_RECEIVING_ADDRESS);
+      gate.resolve();
+      const [editorBase] = await editorRead;
+      assert(editorBase);
+      vi.setSystemTime(Date.now() + 2000);
+      await nativeCommunityRequest(community, "profile", {
+        name: "Editor",
+        picture: "",
+        about: "Edited",
+        existing: JSON.parse(editorBase.content),
+      });
+      expect(JSON.parse(head.content)).toMatchObject({
+        name: "Editor",
+        about: "Edited",
+        custom: "keep",
+        lud16: TEST_RECEIVING_ADDRESS,
+      });
+      expect(head.tags).toEqual(original.tags);
+      expect(verifyEvent(head)).toBe(true);
+    } finally {
+      gate.resolve();
+      await editorRead.catch(() => {});
+      store.dispose();
+    }
+  },
+);
+
+it("saves an ordinary profile after consecutive receiving updates in the same second", async () => {
+  let head = signed(viewer, {
+    kind: 0,
+    tags: [],
+    content: JSON.stringify({ name: "Before" }),
+  });
+  respond = (request) => {
+    if (request.path === "/query") return { body: [head] };
+    assert(request.body);
+    const event = JSON.parse(request.body);
+    head = newer(head, event);
+    return { body: { accepted: head.id === event.id, event_id: event.id } };
+  };
+  const store = createRelaySession(await connectNativeTransport(community));
+  try {
+    for (const address of [
+      TEST_UPDATED_RECEIVING_ADDRESS,
+      TEST_RECEIVING_ADDRESS,
+    ])
+      await store.session.receivingAddress?.update(
+        address,
+        new AbortController().signal,
+      );
+    const receivingHead = head;
+    expect(head.created_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    await nativeCommunityRequest(community, "profile", {
+      name: "Editor",
+      picture: "",
+      existing: JSON.parse(head.content),
+    });
+    expect(head.created_at).toBeGreaterThan(receivingHead.created_at);
+    expect(JSON.parse(head.content)).toMatchObject({
+      name: "Editor",
+      lud16: TEST_RECEIVING_ADDRESS,
+    });
+  } finally {
+    store.dispose();
   }
 });
 

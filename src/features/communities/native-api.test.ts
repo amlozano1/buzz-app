@@ -286,7 +286,10 @@ it("restores a signed community profile and preserves extra fields when publishi
     picture: "",
     nip05: "person@example.test",
   });
-  respond = () => ({ body: { accepted: true, event_id: "unrelated" } });
+  respond = (path) =>
+    path === "/query"
+      ? { body: [event] }
+      : { body: { accepted: true, event_id: "unrelated" } };
   await expect(
     publishProfile(community, found.profile, found.existing),
   ).rejects.toThrow("not confirmed");

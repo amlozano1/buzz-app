@@ -68,6 +68,8 @@ the interface unless an available tool actually supports that action.
   more than one community.
 - Set or clear your status from the profile menu, or with **Update status** /
   **Set a status** on your own profile.
+- Editing your community profile keeps fields added by plugins, including a
+  Lightning receiving address.
 - Where a community verifies names, the profile check appears beside the verified
   full name, or the verified username when no full name is supplied. The profile
   shows the issuer and verification time; cached verification has no check.

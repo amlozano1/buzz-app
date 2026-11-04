@@ -31,7 +31,11 @@ import { createOutbox, PublishRejected } from "../src/features/relay/outbox.ts";
 import { createRelaySession } from "../src/features/relay/session.ts";
 import { feedbackEvent } from "../src/features/relay/product-feedback.ts";
 import { archiveRequestTemplate } from "../src/features/relay/identity-archive-protocol.ts";
-import { TEST_RECEIVING_ADDRESS } from "../src/features/communities/receiving-profile-fixture.ts";
+import { newer } from "../src/features/relay/events.ts";
+import {
+  TEST_RECEIVING_ADDRESS,
+  TEST_UPDATED_RECEIVING_ADDRESS,
+} from "../src/features/communities/receiving-profile-fixture.ts";
 
 // Only wall time is controlled. Real timers/performance.now still exercise HTTP admission.
 let wallClock;
@@ -383,6 +387,218 @@ test("a cancelled browser save retains profile ownership until its dispatched wr
   } finally {
     release();
     await saving.catch(() => {});
+    await h.close();
+  }
+});
+
+test.each(["failure", "cancel"])(
+  "an editor preflight %s sends no profile and releases ownership",
+  async (outcome) => {
+    let entered, release;
+    const started = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const h = await harness(async (call, count) => {
+      if (count === 1) {
+        entered();
+        await gate;
+        return outcome === "cancel"
+          ? Response.json([])
+          : new Response(null, { status: 503 });
+      }
+      return call.url.endsWith("/query")
+        ? Response.json([])
+        : Response.json({ accepted: true, event_id: call.body.id });
+    });
+    const closed = new Promise((resolve) => {
+      h.server.once("request", (_request, response) =>
+        response.once("close", resolve),
+      );
+    });
+    const controller = new AbortController();
+    const saving = h.post(
+      "profile",
+      { name: "Editor", picture: "" },
+      controller.signal,
+    );
+    const settled = saving.then(
+      (response) => response,
+      (error) => error,
+    );
+    try {
+      await started;
+      expect(
+        (await h.post("profile", { name: "Overlap", picture: "" })).status,
+      ).toBe(409);
+      if (outcome === "cancel") {
+        controller.abort();
+        await settled;
+        await closed;
+      }
+      release();
+      const result = await settled;
+      if (outcome === "cancel") expect(result).toBeInstanceOf(Error);
+      else {
+        expect(result.status).toBe(503);
+        expect(await result.json()).toMatchObject({ sent: false });
+      }
+      expect(h.calls.map((call) => new URL(call.url).pathname)).toEqual([
+        "/query",
+      ]);
+      await expect
+        .poll(
+          async () =>
+            (await h.post("profile", { name: "Retry", picture: "" })).status,
+        )
+        .toBe(200);
+      expect(h.calls.map((call) => new URL(call.url).pathname)).toEqual([
+        "/query",
+        "/query",
+        "/events",
+      ]);
+    } finally {
+      release();
+      await settled;
+      await h.close();
+    }
+  },
+);
+
+test.each([undefined, TEST_UPDATED_RECEIVING_ADDRESS])(
+  "preserves the saved receiving address after a delayed editor read (previous: %s)",
+  async (previousAddress) => {
+    const key = new Uint8Array(32);
+    key[31] = 7;
+    const original = finalizeEvent(
+      {
+        kind: 0,
+        tags: [["keep", "tag"]],
+        created_at: 1699999999,
+        content: JSON.stringify({
+          name: "Before",
+          custom: "keep",
+          lud16: previousAddress,
+        }),
+      },
+      key,
+    );
+    let head = original,
+      holdEditorRead = true,
+      entered,
+      release;
+    const started = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const h = await harness(async (call) => {
+      if (call.url.endsWith("/query")) {
+        if (holdEditorRead) {
+          holdEditorRead = false;
+          entered();
+          await gate;
+          return Response.json([original]);
+        }
+        return Response.json([head]);
+      }
+      head = newer(head, call.body);
+      return Response.json({
+        accepted: head.id === call.body.id,
+        event_id: call.body.id,
+      });
+    });
+    const store = createRelaySession(await connectBrokerTransport(h.base));
+    const editorRead = h.post("query", [
+      {
+        kinds: [0],
+        authors: [original.pubkey],
+        limit: 5,
+        consistency: "strong",
+      },
+    ]);
+    try {
+      await started;
+      await store.session.receivingAddress.update(
+        TEST_RECEIVING_ADDRESS,
+        new AbortController().signal,
+      );
+      expect(JSON.parse(head.content).lud16).toBe(TEST_RECEIVING_ADDRESS);
+      release();
+      const [editorBase] = await (await editorRead).json();
+      wallClock += 2000;
+      const saved = await h.post("profile", {
+        name: "Editor",
+        picture: "",
+        about: "Edited",
+        existing: JSON.parse(editorBase.content),
+      });
+      expect((await saved.json()).accepted).toBe(true);
+      expect(JSON.parse(head.content)).toMatchObject({
+        name: "Editor",
+        about: "Edited",
+        custom: "keep",
+        lud16: TEST_RECEIVING_ADDRESS,
+      });
+      expect(head.tags).toEqual(original.tags);
+      expect(verifyEvent(head)).toBe(true);
+    } finally {
+      release();
+      await editorRead.catch(() => {});
+      store.dispose();
+      await h.close();
+    }
+  },
+);
+
+test("saves an ordinary profile after consecutive receiving updates in the same second", async () => {
+  const key = new Uint8Array(32);
+  key[31] = 7;
+  let head = finalizeEvent(
+    {
+      kind: 0,
+      tags: [],
+      created_at: 1699999999,
+      content: JSON.stringify({ name: "Before" }),
+    },
+    key,
+  );
+  const h = await harness((call) => {
+    if (call.url.endsWith("/query")) return Response.json([head]);
+    head = newer(head, call.body);
+    return Response.json({
+      accepted: head.id === call.body.id,
+      event_id: call.body.id,
+    });
+  });
+  const store = createRelaySession(await connectBrokerTransport(h.base));
+  try {
+    for (const address of [
+      TEST_UPDATED_RECEIVING_ADDRESS,
+      TEST_RECEIVING_ADDRESS,
+    ])
+      await store.session.receivingAddress.update(
+        address,
+        new AbortController().signal,
+      );
+    const receivingHead = head;
+    expect(head.created_at).toBeGreaterThan(Math.floor(Date.now() / 1000));
+    const saved = await h.post("profile", {
+      name: "Editor",
+      picture: "",
+      existing: JSON.parse(head.content),
+    });
+    expect((await saved.json()).accepted).toBe(true);
+    expect(head.created_at).toBeGreaterThan(receivingHead.created_at);
+    expect(JSON.parse(head.content)).toMatchObject({
+      name: "Editor",
+      lud16: TEST_RECEIVING_ADDRESS,
+    });
+  } finally {
+    store.dispose();
     await h.close();
   }
 });
@@ -1368,8 +1584,16 @@ test("upstream quota survives browser recreation, gates reads/profile and leaves
     expect(
       (await h.post("profile", { name: "Fixture", picture: "" })).status,
     ).toBe(200);
-    expect(h.calls).toHaveLength(3);
-    expect(h.calls[2].body.kind).toBe(0);
+    expect(h.calls).toHaveLength(4);
+    expect(h.calls[2].body).toEqual([
+      {
+        kinds: [0],
+        authors: [h.event.pubkey],
+        limit: 5,
+        consistency: "strong",
+      },
+    ]);
+    expect(h.calls[3].body.kind).toBe(0);
     expect(h.calls[2].at - h.calls[0].at).toBeGreaterThanOrEqual(1000);
   } finally {
     await h.close();
@@ -1382,7 +1606,11 @@ test("foreground profile publication starts while background I/O is outstanding;
     release = resolve;
   });
   const h = await harness(async (call, count, event) => {
-    if (call.url.endsWith("/query")) await held;
+    if (
+      call.url.endsWith("/query") &&
+      !call.body.some((filter) => filter.consistency === "strong")
+    )
+      await held;
     return success(call, count, event);
   });
   const cancel = new AbortController();
@@ -1399,6 +1627,7 @@ test("foreground profile publication starts while background I/O is outstanding;
     await rejection;
     release();
     expect(h.calls.map((c) => c.url.split("/").at(-1))).toEqual([
+      "query",
       "query",
       "events",
     ]);
@@ -1561,8 +1790,10 @@ test("local capacity is explicitly unsent, not relay quota; unknown upstream pub
     for (const c of controllers) c.abort();
     await h.close();
   }
-  const uncertain = await harness(
-    () => new Response("private upstream detail", { status: 503 }),
+  const uncertain = await harness((call) =>
+    call.url.endsWith("/query")
+      ? Response.json([])
+      : new Response("private upstream detail", { status: 503 }),
   );
   try {
     const response = await uncertain.post("profile", {
@@ -1571,9 +1802,12 @@ test("local capacity is explicitly unsent, not relay quota; unknown upstream pub
     });
     expect(response.status).toBe(503);
     expect(await response.json()).not.toHaveProperty("sent");
-    expect(uncertain.calls).toHaveLength(1);
+    expect(uncertain.calls.map((call) => new URL(call.url).pathname)).toEqual([
+      "/query",
+      "/events",
+    ]);
     await delay(550);
-    expect(uncertain.calls).toHaveLength(1);
+    expect(uncertain.calls).toHaveLength(2);
   } finally {
     await uncertain.close();
   }

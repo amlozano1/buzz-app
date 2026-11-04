@@ -15,7 +15,12 @@ import { eventDto } from "../relay/events";
 import { readApiFailure } from "../relay/http-admission";
 import { admitSignedRequest } from "../relay/transport";
 import type { PersonalProfile } from "./service";
-import { reserveProfilePublication } from "./profile-publication";
+import {
+  editedProfileTemplate,
+  profileHead,
+  profilePublicationFilter,
+  reserveProfilePublication,
+} from "./profile-publication";
 
 export async function nativeCommunityRequest(
   community: string,
@@ -164,9 +169,7 @@ export async function nativeCommunityRequest(
     );
   }
   if (route === "profile") {
-    const profile = body as PersonalProfile & {
-      existing?: Record<string, unknown>;
-    };
+    const profile = body as PersonalProfile;
     if (
       !profile ||
       typeof profile.name !== "string" ||
@@ -178,33 +181,26 @@ export async function nativeCommunityRequest(
         (typeof profile.about !== "string" || profile.about.length > 500))
     )
       throw new Error("Check your profile name, picture and description");
-    const content = JSON.stringify({
-      ...profile.existing,
-      name: profile.name.trim(),
-      display_name: profile.name.trim(),
-      picture: profile.picture,
-      about: (
-        profile.about ??
-        (typeof profile.existing?.about === "string"
-          ? profile.existing.about
-          : "")
-      ).trim(),
-    });
-    if (new TextEncoder().encode(content).length > 16000)
-      throw new Error("Profile too large");
     const signer = nativeRelaySigner(community);
+    const viewer = await signer.getPublicKey();
     const release = reserveProfilePublication(
       communityDestination(community).url,
-      await signer.getPublicKey(),
+      viewer,
     );
     try {
       signal.throwIfAborted();
-      const event = await signer.signEvent({
-        kind: 0,
-        created_at: Math.floor(Date.now() / 1000),
-        tags: [],
-        content,
-      });
+      const current = profileHead(
+        await nativeSignedQuery(
+          community,
+          profilePublicationFilter(viewer),
+          signal,
+          "foreground",
+        ),
+        viewer,
+      );
+      const event = await signer.signEvent(
+        editedProfileTemplate(profile, current),
+      );
       const result = await readResponse(
         await nativeRelayRequest(community, "/events", event, signal),
       );
@@ -250,6 +246,7 @@ async function nativeSignedQuery(
   community: string,
   filters: unknown,
   signal: AbortSignal,
+  priority: "foreground" | "background" = "background",
 ): Promise<unknown[]> {
   if (!Array.isArray(filters) || !filters.length)
     throw new Error("Invalid community query");
@@ -260,7 +257,7 @@ async function nativeSignedQuery(
     viewer,
     () => nativeRelayRequest(origin, "/query", filters, signal),
     signal,
-    "background",
+    priority,
   );
   signal.throwIfAborted();
   if (!response.ok) throw new Error((await readApiFailure(response)).error);

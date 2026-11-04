@@ -1,4 +1,5 @@
 import { verifyEvent, type Event, type EventTemplate } from "nostr-tools/pure";
+import { nextProfileTimestamp } from "./profile-publication.ts";
 
 /** The host accepts an existing, own signed profile and one address, never an
  * arbitrary replacement document or a template for general identity signing. */
@@ -37,14 +38,11 @@ export function receivingProfileTemplate(
   const content = JSON.stringify(next);
   if (new TextEncoder().encode(content).length > 16000)
     throw new Error("Profile too large");
-  const now = Math.floor(Date.now() / 1000);
-  if (profile.created_at > now + 60)
-    throw new Error("Your profile timestamp is ahead of this device's clock");
   return {
     kind: 0,
     content,
     tags: profile.tags,
-    created_at: Math.max(now, profile.created_at + 1),
+    created_at: nextProfileTimestamp(profile.created_at),
   };
 }
 

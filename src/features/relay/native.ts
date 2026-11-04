@@ -11,7 +11,7 @@ import { nativeSocket } from "./native-socket";
 import { receivingProfileTemplate } from "../communities/receiving-profile";
 import {
   assertReceivingProfileHead,
-  receivingProfileFilter,
+  profilePublicationFilter,
   reserveProfilePublication,
 } from "../communities/profile-publication";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
@@ -858,7 +858,7 @@ export async function connectNativeTransport(
         const current = await nativeRelayRequest(
           origin,
           "/query",
-          receivingProfileFilter(transport.viewer),
+          profilePublicationFilter(transport.viewer),
           signal,
         );
         if (!current.ok) throw new Error((await readApiFailure(current)).error);

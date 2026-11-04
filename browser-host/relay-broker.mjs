@@ -2,7 +2,9 @@ import { isSidebarPreferencesBatch } from "../src/features/relay/sidebar-prefere
 import { receivingProfileTemplate } from "../src/features/communities/receiving-profile.ts";
 import {
   assertReceivingProfileHead,
-  receivingProfileFilter,
+  editedProfileTemplate,
+  profileHead,
+  profilePublicationFilter,
   reserveProfilePublication,
 } from "../src/features/communities/profile-publication.ts";
 import {
@@ -2758,30 +2760,6 @@ export function relayBrokerPlugin({
                 error:
                   "Profile needs a name, an optional HTTPS picture URL, and a description of 500 characters or fewer",
               });
-            // Preserve fields this small editor does not expose.
-            const content = {
-              ...(filters.existing ?? {}),
-              name: filters.name.trim(),
-              display_name: filters.name.trim(),
-              picture: filters.picture,
-              about:
-                filters.about === undefined
-                  ? typeof filters.existing?.about === "string"
-                    ? filters.existing.about
-                    : ""
-                  : filters.about.trim(),
-            };
-            if (Buffer.byteLength(JSON.stringify(content)) > 16000)
-              return json(res, 400, { error: "Profile too large" });
-            filters = finalizeEvent(
-              {
-                kind: 0,
-                content: JSON.stringify(content),
-                tags: [],
-                created_at: Math.floor(Date.now() / 1000),
-              },
-              key,
-            );
           }
           if (claim || policy) {
             if (
@@ -3154,7 +3132,7 @@ export function relayBrokerPlugin({
             });
           if (!presence) inflight++;
           try {
-            const body = workflowPath ? undefined : JSON.stringify(filters);
+            let body = workflowPath ? undefined : JSON.stringify(filters);
             const admissionStart = performance.now();
             let connectsBefore, upstreamStart;
             let response;
@@ -3221,13 +3199,13 @@ export function relayBrokerPlugin({
                 return response;
               });
             };
-            if (receiving) {
+            if (profile) {
               const current = await admittedApiRequest(
                 lane,
                 () =>
                   request(
                     "/query",
-                    JSON.stringify(receivingProfileFilter(viewer)),
+                    JSON.stringify(profilePublicationFilter(viewer)),
                   ),
                 requestSignal,
               );
@@ -3237,11 +3215,16 @@ export function relayBrokerPlugin({
                   sent: false,
                 });
               try {
-                assertReceivingProfileHead(
-                  await current.json(),
-                  viewer,
-                  receivingBase,
-                );
+                const raw = await current.json();
+                if (receiving) {
+                  assertReceivingProfileHead(raw, viewer, receivingBase);
+                } else {
+                  filters = finalizeEvent(
+                    editedProfileTemplate(filters, profileHead(raw, viewer)),
+                    key,
+                  );
+                  body = JSON.stringify(filters);
+                }
               } catch (error) {
                 return json(res, 409, { error: error.message, sent: false });
               }

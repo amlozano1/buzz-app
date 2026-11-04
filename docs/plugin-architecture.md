@@ -1819,7 +1819,10 @@ event as the current profile head. A superseding head is unconfirmed even if its
 address matches. Each host runtime rejects overlapping profile publications and
 rechecks the signed base after signing, before sending. An observed change fails
 without publication. This is not relay-side compare-and-swap: another device can
-still write between the final check and publication. It publishes once and never
+still write between the final check and publication. The standard profile editor
+also reads the current signed head inside the reservation before merging its
+editable fields; stale caller metadata cannot replace a saved address. Both
+writers choose a timestamp newer than the current head. It publishes once and never
 retries a write. Bind the call to the ready session's
 lifetime; a cancelled or unconfirmed call may have reached the relay, so inspect
 the profile before trying again. Cached sessions do not offer it. The host keeps
