@@ -31,6 +31,7 @@ import { createOutbox, PublishRejected } from "../src/features/relay/outbox.ts";
 import { createRelaySession } from "../src/features/relay/session.ts";
 import { feedbackEvent } from "../src/features/relay/product-feedback.ts";
 import { archiveRequestTemplate } from "../src/features/relay/identity-archive-protocol.ts";
+import { TEST_RECEIVING_ADDRESS } from "../src/features/communities/receiving-profile-fixture.ts";
 
 // Only wall time is controlled. Real timers/performance.now still exercise HTTP admission.
 let wallClock;
@@ -179,10 +180,10 @@ test("receiving-address host route signs only an own profile patch, confirms rea
     expect(store.session.outbox?.supports(0)).toBe(false);
     await expect(
       store.session.receivingAddress?.update(
-        "sam@lexe.app",
+        TEST_RECEIVING_ADDRESS,
         new AbortController().signal,
       ),
-    ).resolves.toBe("sam@lexe.app");
+    ).resolves.toBe(TEST_RECEIVING_ADDRESS);
     const published = h.calls.findLast((call) =>
       call.url.endsWith("/events"),
     ).body;
@@ -193,22 +194,29 @@ test("receiving-address host route signs only an own profile patch, confirms rea
       name: "Sam",
       display_name: "Different",
       about: "Keep bio",
-      lud16: "sam@lexe.app",
+      lud16: TEST_RECEIVING_ADDRESS,
     });
     expect(store.session.profiles.event(viewer).id).toBe(published.id);
     expect(published.created_at).toBeGreaterThan(profile.created_at);
     const before = h.calls.length;
     for (const body of [
       { address: "bad", profile },
-      { address: "sam@lexe.app", profile: { ...profile, content: "{}" } },
-      { address: "sam@lexe.app", profile, content: "{}" },
+      {
+        address: TEST_RECEIVING_ADDRESS,
+        profile: { ...profile, content: "{}" },
+      },
+      { address: TEST_RECEIVING_ADDRESS, profile, content: "{}" },
     ])
       expect((await h.post("receiving-address", body)).status).toBe(400);
     expect(h.calls.length).toBe(before);
     confirm = false;
     expect(
-      (await h.post("receiving-address", { address: "sam@lexe.app", profile }))
-        .status,
+      (
+        await h.post("receiving-address", {
+          address: TEST_RECEIVING_ADDRESS,
+          profile,
+        })
+      ).status,
     ).toBe(502);
   } finally {
     store?.dispose();

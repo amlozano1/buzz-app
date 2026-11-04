@@ -2,6 +2,7 @@ import { expect, it } from "vitest";
 import { createRelaySession } from "./session";
 import { keypair, signed, scriptedTransport } from "./testing";
 import { receivingProfileTemplate } from "../communities/receiving-profile";
+import { TEST_RECEIVING_ADDRESS } from "../communities/receiving-profile-fixture";
 import type { ReadTransport } from "./transport";
 
 it("publishes once through the narrow writer and updates the shared profile only after verified readback", async () => {
@@ -32,16 +33,16 @@ it("publishes once through the narrow writer and updates the shared profile only
     expect(store.session.outbox?.supports(0)).toBeFalsy();
     await expect(
       store.session.receivingAddress?.update(
-        "sam@lexe.app",
+        TEST_RECEIVING_ADDRESS,
         new AbortController().signal,
       ),
-    ).resolves.toBe("sam@lexe.app");
+    ).resolves.toBe(TEST_RECEIVING_ADDRESS);
     expect(sends).toBe(1);
     expect(
       JSON.parse(
         store.session.profiles.event?.(viewer.pubkey)?.content ?? "null",
       ),
-    ).toEqual({ name: "Sam", about: "Bio", lud16: "sam@lexe.app" });
+    ).toEqual({ name: "Sam", about: "Bio", lud16: TEST_RECEIVING_ADDRESS });
     expect(head.tags).toEqual([["keep", "tag"]]);
   } finally {
     store.dispose();
@@ -70,7 +71,7 @@ it("does not retry publication or accept an unconfirmed readback, and fences dis
   try {
     await expect(
       store.session.receivingAddress?.update(
-        "sam@lexe.app",
+        TEST_RECEIVING_ADDRESS,
         new AbortController().signal,
       ),
     ).rejects.toThrow("Unconfirmed publication");
@@ -78,7 +79,7 @@ it("does not retry publication or accept an unconfirmed readback, and fences dis
     fail = false;
     await expect(
       store.session.receivingAddress?.update(
-        "sam@lexe.app",
+        TEST_RECEIVING_ADDRESS,
         new AbortController().signal,
       ),
     ).rejects.toThrow("not been confirmed");
@@ -88,7 +89,7 @@ it("does not retry publication or accept an unconfirmed readback, and fences dis
   }
   await expect(
     store.session.receivingAddress?.update(
-      "sam@lexe.app",
+      TEST_RECEIVING_ADDRESS,
       new AbortController().signal,
     ),
   ).rejects.toThrow();

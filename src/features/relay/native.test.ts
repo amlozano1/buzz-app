@@ -24,6 +24,10 @@ import { keypair, message, nativeSignatureChecks, signed } from "./testing";
 import { createOutbox, type OutgoingEvent, PublishRejected } from "./outbox";
 import { createMessages } from "./messages";
 import { createRelaySession } from "./session";
+import {
+  TEST_RECEIVING_ADDRESS,
+  TEST_UPDATED_RECEIVING_ADDRESS,
+} from "../communities/receiving-profile-fixture";
 
 const progressChannels = new Map<string, (message: unknown) => void>();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -94,10 +98,10 @@ it("updates receiving through the native profile publisher, verifies readback, a
     expect(store.session.outbox?.supports(0)).toBe(false);
     await expect(
       store.session.receivingAddress?.update(
-        "sam@lexe.app",
+        TEST_RECEIVING_ADDRESS,
         new AbortController().signal,
       ),
-    ).resolves.toBe("sam@lexe.app");
+    ).resolves.toBe(TEST_RECEIVING_ADDRESS);
     expect(verifyEvent(profile)).toBe(true);
     expect(profile.pubkey).toBe(viewer.pubkey);
     expect(profile.tags).toEqual([["keep", "tag"]]);
@@ -109,12 +113,12 @@ it("updates receiving through the native profile publisher, verifies readback, a
       name: "Sam",
       display_name: "Different",
       about: "Keep bio",
-      lud16: "sam@lexe.app",
+      lud16: TEST_RECEIVING_ADDRESS,
     });
     confirm = false;
     await expect(
       store.session.receivingAddress?.update(
-        "sam2@lexe.app",
+        TEST_UPDATED_RECEIVING_ADDRESS,
         new AbortController().signal,
       ),
     ).rejects.toThrow("not confirmed");

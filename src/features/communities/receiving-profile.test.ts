@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import { keypair, signed } from "../relay/testing";
 import { receivingProfileTemplate } from "./receiving-profile";
+import { TEST_RECEIVING_ADDRESS } from "./receiving-profile-fixture";
 
 it("changes only the receiving fields of the viewer's signed profile, preserving tags and other metadata", () => {
   const viewer = keypair();
@@ -20,13 +21,13 @@ it("changes only the receiving fields of the viewer's signed profile, preserving
     created_at: Math.floor(Date.now() / 1000),
   });
   const template = receivingProfileTemplate(
-    { address: " sam@lexe.app ", profile },
+    { address: ` ${TEST_RECEIVING_ADDRESS} `, profile },
     viewer.pubkey,
   );
   expect(JSON.parse(template.content)).toEqual({
     ...metadata,
     lud06: undefined,
-    lud16: "sam@lexe.app",
+    lud16: TEST_RECEIVING_ADDRESS,
   });
   expect(template.tags).toEqual(profile.tags);
   expect(template.kind).toBe(0);
@@ -41,15 +42,15 @@ it("rejects another author, forged metadata, invalid addresses, and arbitrary fi
     content: JSON.stringify({ name: "Sam" }),
   });
   for (const input of [
-    { address: "sam@lexe.app", profile: { ...profile, content: "{}" } },
-    { address: "sam@lexe.app", profile, content: "{}" },
+    { address: TEST_RECEIVING_ADDRESS, profile: { ...profile, content: "{}" } },
+    { address: TEST_RECEIVING_ADDRESS, profile, content: "{}" },
     { address: 5, profile },
-    { address: "https://evil.test/", profile },
+    { address: "https://example.invalid/", profile },
   ])
     expect(() => receivingProfileTemplate(input, viewer.pubkey)).toThrow();
   expect(() =>
     receivingProfileTemplate(
-      { address: "sam@lexe.app", profile },
+      { address: TEST_RECEIVING_ADDRESS, profile },
       keypair().pubkey,
     ),
   ).toThrow();
