@@ -58,8 +58,8 @@ async function capture(surface, info, name) {
     await surface.screenshot({ path: info.outputPath(`${name}.png`) });
 }
 
-// These preserve the two browser journeys: actual routing, signed discovery,
-// broker save/readback, focus and responsive overlays. Role matrices stay in Vitest.
+// Browser-only: actual routing, signed discovery, broker save/readback, focus
+// and responsive overlays. Role matrices stay in Vitest.
 test.describe("owner", () => {
   test.use({
     channelIds: [own],
@@ -68,33 +68,35 @@ test.describe("owner", () => {
     ownSoloChannels: [own],
     historyCounts: { [own]: 2 },
   });
-  test("omits Public, retains View only after reload, and restores privacy", async ({
-    page,
-    app,
-  }, info) => {
-    await openChat(page, app, own);
-    const row = page.locator(`[data-solo-channel-id="${own}"]`);
-    const access = page
-      .getByRole("button", { name: "Share access", exact: true })
-      .last();
-    const dialog = page.getByRole("dialog", {
-      name: "Share access",
-      exact: true,
-    });
-    const audience = dialog.getByRole("combobox", { name: "General access" });
-    const openAccess = async () => {
-      // Cached startup renders Share access too. Its local dialog is replaced
-      // with the live session; Chat actions exists only on the live header.
-      await expect(
-        page.getByRole("button", { name: "Chat actions", exact: true }),
-      ).toBeVisible();
-      await access.click();
-    };
-    const confirm = page.getByRole("alertdialog", {
-      name: "Change general access?",
-    });
-    let saves = 0;
-    for (const presentation of presentations) {
+  // Each presentation owns a complete journey and fixture so the four-way
+  // geometry matrix does not consume one shared test deadline.
+  for (const presentation of presentations) {
+    test(`omits Public, retains View only after reload, and restores privacy (${presentation.mode}, ${presentation.width})`, async ({
+      page,
+      app,
+    }, info) => {
+      await openChat(page, app, own);
+      const row = page.locator(`[data-solo-channel-id="${own}"]`);
+      const access = page
+        .getByRole("button", { name: "Share access", exact: true })
+        .last();
+      const dialog = page.getByRole("dialog", {
+        name: "Share access",
+        exact: true,
+      });
+      const audience = dialog.getByRole("combobox", { name: "General access" });
+      const openAccess = async () => {
+        // Cached startup renders Share access too. Its local dialog is replaced
+        // with the live session; Chat actions exists only on the live header.
+        await expect(
+          page.getByRole("button", { name: "Chat actions", exact: true }),
+        ).toBeVisible();
+        await access.click();
+      };
+      const confirm = page.getByRole("alertdialog", {
+        name: "Change general access?",
+      });
+      let saves = 0;
       const suffix = `${presentation.mode}_${presentation.width}`;
       await present(page, presentation);
       if (presentation.width === 1440) await expect(row).toBeVisible();
@@ -216,15 +218,12 @@ test.describe("owner", () => {
         dialog.getByRole("button", { name: "Done", exact: true }),
       ).toBeInViewport({ ratio: 1 });
       await page.keyboard.press("Escape");
-    }
-    // The longer conditional descriptions need real modal geometry and focus
-    // coverage. Guest/status matrices remain in the component/session tests.
-    const guest = app.serveProfile(generateSecretKey(), {
-      name: "Aria viewer",
-    });
-    app.addChannelGuest(own, guest.pubkey);
-    for (const presentation of presentations) {
-      const suffix = `${presentation.mode}_${presentation.width}`;
+      // The longer conditional descriptions need real modal geometry and focus
+      // coverage. Guest/status matrices remain in the component/session tests.
+      const guest = app.serveProfile(generateSecretKey(), {
+        name: "Aria viewer",
+      });
+      app.addChannelGuest(own, guest.pubkey);
       app.setChannelMetadata(own, [
         ["t", "stream"],
         ["t", "buzz.solo"],
@@ -300,13 +299,13 @@ test.describe("owner", () => {
       await page.keyboard.press("Escape");
       await expect(audience).toBeFocused();
       await page.keyboard.press("Escape");
-    }
-    expect(app.report.detailsPublications.map(({ kind }) => kind)).toEqual(
-      Array(8).fill(9002),
-    );
-    expect(app.report.lifecyclePublications ?? []).toEqual([]);
-    expect(app.report.publications).toEqual([]);
-  });
+      expect(app.report.detailsPublications.map(({ kind }) => kind)).toEqual(
+        Array(2).fill(9002),
+      );
+      expect(app.report.lifecyclePublications ?? []).toEqual([]);
+      expect(app.report.publications).toEqual([]);
+    });
+  }
 });
 
 test.describe("visitor", () => {
