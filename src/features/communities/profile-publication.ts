@@ -46,9 +46,10 @@ export function editedProfileTemplate(
   head: RelayEvent | undefined,
 ): EventTemplate {
   const metadata: unknown = head ? JSON.parse(head.content) : {};
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
-    throw new Error("Invalid profile metadata");
-  const existing = metadata as Record<string, unknown>;
+  const existing: Record<string, unknown> =
+    metadata && typeof metadata === "object" && !Array.isArray(metadata)
+      ? (metadata as Record<string, unknown>)
+      : {};
   const content = JSON.stringify({
     ...existing,
     name: input.name.trim(),

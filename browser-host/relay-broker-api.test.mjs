@@ -149,177 +149,294 @@ async function harness(
 const blob = "c".repeat(64);
 const filters = [{ kinds: [0], limit: 1 }];
 
-test("receiving-address host route signs only an own profile patch, confirms readback, and checks the exact receipt", async () => {
-  const key = new Uint8Array(32);
-  key[31] = 7;
-  const viewer = getPublicKey(key);
-  const profile = finalizeEvent(
-    {
-      kind: 0,
-      created_at: 1699999999,
-      tags: [["keep", "tag"]],
-      content: JSON.stringify({
-        name: "Sam",
-        display_name: "Different",
-        about: "Keep bio",
-        lud06: "old",
-      }),
-    },
-    key,
-  );
-  let head = profile,
-    confirm = true;
-  const h = await harness((call) => {
-    if (call.url.endsWith("/query")) return Response.json([head]);
-    if (call.url.endsWith("/events")) head = call.body;
-    return Response.json({
-      accepted: true,
-      event_id: confirm ? call.body.id : "unrelated",
-    });
-  });
-  let store;
-  try {
-    expect((await (await h.get("session")).json()).receivingAddress).toBe(true);
-    store = createRelaySession(await connectBrokerTransport(h.base));
-    expect(store.session.outbox?.supports(0)).toBe(false);
-    await expect(
-      store.session.receivingAddress?.update(
-        TEST_RECEIVING_ADDRESS,
-        new AbortController().signal,
-      ),
-    ).resolves.toBe(TEST_RECEIVING_ADDRESS);
-    const published = h.calls.findLast((call) =>
-      call.url.endsWith("/events"),
-    ).body;
-    expect(verifyEvent(published)).toBe(true);
-    expect(published.pubkey).toBe(viewer);
-    expect(published.tags).toEqual(profile.tags);
-    expect(JSON.parse(published.content)).toEqual({
-      name: "Sam",
-      display_name: "Different",
-      about: "Keep bio",
-      lud16: TEST_RECEIVING_ADDRESS,
-    });
-    expect(store.session.profiles.event(viewer).id).toBe(published.id);
-    expect(published.created_at).toBeGreaterThan(profile.created_at);
-    const before = h.calls.length;
-    for (const body of [
-      { address: "bad", profile },
-      {
-        address: TEST_RECEIVING_ADDRESS,
-        profile: { ...profile, content: "{}" },
-      },
-      { address: TEST_RECEIVING_ADDRESS, profile, content: "{}" },
-    ])
-      expect((await h.post("receiving-address", body)).status).toBe(400);
-    expect(h.calls.length).toBe(before);
-    confirm = false;
-    expect(
-      (
-        await h.post("receiving-address", {
-          address: TEST_RECEIVING_ADDRESS,
-          profile: head,
-        })
-      ).status,
-    ).toBe(502);
-  } finally {
-    store?.dispose();
-    await h.close();
-  }
-});
-
-test("receiving preflight rejects changed heads and excludes overlapping broker profile writers", async () => {
-  const key = new Uint8Array(32);
-  key[31] = 7;
-  const original = finalizeEvent(
-    {
-      kind: 0,
-      created_at: 1699999998,
-      tags: [],
-      content: JSON.stringify({ name: "Before" }),
-    },
-    key,
-  );
-  let head = original;
-  let entered, release;
-  const started = new Promise((resolve) => {
-    entered = resolve;
-  });
-  const gate = new Promise((resolve) => {
-    release = resolve;
-  });
-  const h = await harness(async (call) => {
-    if (call.url.endsWith("/query")) {
-      expect(call.body).toEqual([
-        {
-          kinds: [0],
-          authors: [original.pubkey],
-          limit: 5,
-          consistency: "strong",
-        },
-      ]);
-      entered();
-      await gate;
-      return Response.json([head]);
-    }
-    if (call.url.endsWith("/events")) head = call.body;
-    return Response.json({ accepted: true, event_id: call.body.id });
-  });
-  const saving = h.post("receiving-address", {
-    address: TEST_RECEIVING_ADDRESS,
-    profile: original,
-  });
-  try {
-    await started;
-    for (const [route, body] of [
-      [
-        "receiving-address",
-        { address: TEST_RECEIVING_ADDRESS, profile: original },
-      ],
-      ["profile", { name: "Editor", picture: "", existing: {} }],
-    ]) {
-      const response = await h.post(route, body);
-      expect(response.status).toBe(409);
-      expect(await response.json()).toMatchObject({
-        sent: false,
-        error: expect.stringContaining("already in progress"),
-      });
-    }
-    head = finalizeEvent(
+test.each(["update", "clear"])(
+  "%s receiving-address host route signs only an own profile patch, confirms readback, and checks the exact receipt",
+  async (operation) => {
+    const key = new Uint8Array(32);
+    key[31] = 7;
+    const viewer = getPublicKey(key);
+    const profile = finalizeEvent(
       {
         kind: 0,
         created_at: 1699999999,
-        tags: [],
-        content: JSON.stringify({ name: "After", custom: "keep" }),
+        tags: [["keep", "tag"]],
+        content: JSON.stringify({
+          name: "Sam",
+          display_name: "Different",
+          about: "Keep bio",
+          lud06: "old",
+          lud16: TEST_UPDATED_RECEIVING_ADDRESS,
+        }),
       },
       key,
     );
-    release();
-    const response = await saving;
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({
-      sent: false,
-      error: expect.stringContaining("profile changed"),
+    let head = profile,
+      confirm = true;
+    const h = await harness((call) => {
+      if (call.url.endsWith("/query")) return Response.json([head]);
+      if (call.url.endsWith("/events")) head = call.body;
+      return Response.json({
+        accepted: true,
+        event_id: confirm ? call.body.id : "unrelated",
+      });
     });
-    expect(h.calls.filter((call) => call.url.endsWith("/events"))).toHaveLength(
-      0,
+    let store;
+    try {
+      expect((await (await h.get("session")).json()).receivingAddress).toBe(
+        true,
+      );
+      store = createRelaySession(await connectBrokerTransport(h.base));
+      expect(store.session.outbox?.supports(0)).toBe(false);
+      const signal = new AbortController().signal;
+      await expect(
+        operation === "clear"
+          ? store.session.receivingAddress.clear(signal)
+          : store.session.receivingAddress.update(
+              TEST_RECEIVING_ADDRESS,
+              signal,
+            ),
+      ).resolves.toBe(
+        operation === "clear" ? undefined : TEST_RECEIVING_ADDRESS,
+      );
+      const published = h.calls.findLast((call) =>
+        call.url.endsWith("/events"),
+      ).body;
+      expect(verifyEvent(published)).toBe(true);
+      expect(published.pubkey).toBe(viewer);
+      expect(published.tags).toEqual(profile.tags);
+      expect(JSON.parse(published.content)).toEqual({
+        name: "Sam",
+        display_name: "Different",
+        about: "Keep bio",
+        ...(operation === "update" ? { lud16: TEST_RECEIVING_ADDRESS } : {}),
+      });
+      expect(store.session.profiles.event(viewer).id).toBe(published.id);
+      expect(published.created_at).toBeGreaterThan(profile.created_at);
+      const before = h.calls.length;
+      for (const body of [
+        { address: "bad", profile },
+        {
+          address: TEST_RECEIVING_ADDRESS,
+          profile: { ...profile, content: "{}" },
+        },
+        { address: TEST_RECEIVING_ADDRESS, profile, content: "{}" },
+      ])
+        expect((await h.post("receiving-address", body)).status).toBe(400);
+      expect(h.calls.length).toBe(before);
+      confirm = false;
+      expect(
+        (
+          await h.post("receiving-address", {
+            address: TEST_RECEIVING_ADDRESS,
+            profile: head,
+          })
+        ).status,
+      ).toBe(502);
+    } finally {
+      store?.dispose();
+      await h.close();
+    }
+  },
+);
+
+test.each([
+  [
+    "invalid address",
+    "bad",
+    { name: "Sam" },
+    0,
+    "Enter a valid Lightning address",
+  ],
+  [
+    "oversize profile",
+    TEST_RECEIVING_ADDRESS,
+    { name: "Sam", custom: "é".repeat(7990) },
+    0,
+    "Profile too large",
+  ],
+  [
+    "clock ahead",
+    TEST_RECEIVING_ADDRESS,
+    { name: "Sam" },
+    61,
+    "Your profile timestamp is ahead of this device's clock",
+  ],
+])(
+  "browser receiving updates preserve the fixed host guidance for %s",
+  async (_label, address, metadata, ahead, error) => {
+    const key = new Uint8Array(32);
+    key[31] = 7;
+    const profile = finalizeEvent(
+      {
+        kind: 0,
+        tags: [],
+        created_at: Math.floor(Date.now() / 1000) + ahead,
+        content: JSON.stringify(metadata),
+      },
+      key,
     );
-    const retry = await h.post("receiving-address", {
-      address: TEST_RECEIVING_ADDRESS,
-      profile: head,
+    const h = await harness(() => {
+      throw new Error("Validation must not dispatch");
     });
-    expect(retry.status).toBe(200);
-    expect(JSON.parse(head.content)).toEqual({
-      name: "After",
-      custom: "keep",
-      lud16: TEST_RECEIVING_ADDRESS,
+    try {
+      const transport = await connectBrokerTransport(h.base);
+      await expect(
+        transport.updateReceivingAddress(
+          address,
+          profile,
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow(error);
+      expect(h.calls).toHaveLength(0);
+    } finally {
+      await h.close();
+    }
+  },
+);
+
+test.each(["null", "[]", '"text"', "42", "true"])(
+  "broker profile editor repairs signed non-object metadata %s",
+  async (content) => {
+    const key = new Uint8Array(32);
+    key[31] = 7;
+    let head = finalizeEvent(
+      { kind: 0, tags: [["keep", "tag"]], created_at: 1699999999, content },
+      key,
+    );
+    const h = await harness((call) => {
+      if (call.url.endsWith("/query")) return Response.json([head]);
+      head = call.body;
+      return Response.json({ accepted: true, event_id: head.id });
     });
-  } finally {
-    release();
-    await saving.catch(() => {});
-    await h.close();
-  }
-});
+    try {
+      expect(
+        (
+          await h.post("profile", {
+            name: "Repaired",
+            picture: "",
+            about: "New bio",
+          })
+        ).status,
+      ).toBe(200);
+      expect(verifyEvent(head)).toBe(true);
+      expect(JSON.parse(head.content)).toEqual({
+        name: "Repaired",
+        display_name: "Repaired",
+        picture: "",
+        about: "New bio",
+      });
+      expect(head.tags).toEqual([["keep", "tag"]]);
+      expect(head.created_at).toBeGreaterThan(1699999999);
+    } finally {
+      await h.close();
+    }
+  },
+);
+
+test.each([TEST_RECEIVING_ADDRESS, null])(
+  "receiving preflight rejects changed heads and excludes overlapping broker profile writers (address: %s)",
+  async (address) => {
+    const key = new Uint8Array(32);
+    key[31] = 7;
+    const original = finalizeEvent(
+      {
+        kind: 0,
+        created_at: 1699999998,
+        tags: [],
+        content: JSON.stringify({ name: "Before" }),
+      },
+      key,
+    );
+    let head = original;
+    let entered, release;
+    const started = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const h = await harness(async (call) => {
+      if (call.url.endsWith("/query")) {
+        expect(call.body).toEqual([
+          {
+            kinds: [0],
+            authors: [original.pubkey],
+            limit: 5,
+            consistency: "strong",
+          },
+        ]);
+        entered();
+        await gate;
+        return Response.json([head]);
+      }
+      if (call.url.endsWith("/events")) head = call.body;
+      return Response.json({ accepted: true, event_id: call.body.id });
+    });
+    const transport = await connectBrokerTransport(h.base);
+    const saving = transport.updateReceivingAddress(
+      address,
+      original,
+      new AbortController().signal,
+    );
+    void saving.catch(() => {});
+    try {
+      await started;
+      for (const [route, body] of [
+        [
+          "receiving-address",
+          { address: TEST_RECEIVING_ADDRESS, profile: original },
+        ],
+        ["profile", { name: "Editor", picture: "", existing: {} }],
+      ]) {
+        const response = await h.post(route, body);
+        expect(response.status).toBe(409);
+        expect(await response.json()).toMatchObject({
+          sent: false,
+          error: expect.stringContaining("already in progress"),
+        });
+      }
+      await expect(
+        transport.updateReceivingAddress(
+          address,
+          original,
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow(
+        "A profile save is already in progress. Check your profile before saving again.",
+      );
+      head = finalizeEvent(
+        {
+          kind: 0,
+          created_at: 1699999999,
+          tags: [],
+          content: JSON.stringify({ name: "After", custom: "keep" }),
+        },
+        key,
+      );
+      release();
+      await expect(saving).rejects.toThrow(
+        "Your profile changed while saving. Check your profile before saving again.",
+      );
+      expect(
+        h.calls.filter((call) => call.url.endsWith("/events")),
+      ).toHaveLength(0);
+      const retry = await h.post("receiving-address", {
+        address,
+        profile: head,
+      });
+      expect(retry.status).toBe(200);
+      expect(JSON.parse(head.content)).toEqual({
+        name: "After",
+        custom: "keep",
+        ...(address === null ? {} : { lud16: address }),
+      });
+    } finally {
+      release();
+      await saving.catch(() => {});
+      await h.close();
+    }
+  },
+);
 
 test("a cancelled browser save retains profile ownership until its dispatched write settles", async () => {
   const key = new Uint8Array(32);

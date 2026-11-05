@@ -2166,6 +2166,66 @@ export function createRelaySession(
     if (connected && !liveWasConnected) recovery?.retryNow(liveRecovery);
     liveWasConnected = connected;
   });
+  /** One publication, no automatic retry. Fresh reads enter the normal
+   * profile directory so mounted profiles observe the confirmed head. */
+  async function updateReceivingAddress(
+    address: string | null,
+    signal: AbortSignal,
+  ) {
+    const viewer = transport?.viewer;
+    if (!viewer) throw new Error("Profile identity is unavailable");
+    const bound = AbortSignal.any([
+      signal,
+      lifetime.signal,
+      AbortSignal.timeout(30000),
+    ]);
+    const filters = [
+      {
+        kinds: [0],
+        authors: [viewer],
+        limit: 5,
+        consistency: "strong" as const,
+      },
+    ];
+    const readHead = async () => {
+      const events = await finiteRead(
+        filters,
+        { signal: bound, fresh: true },
+        (signal) => readVerified(filters, { signal, fresh: true }),
+      );
+      return events
+        .filter((event) => event.kind === 0 && event.pubkey === viewer)
+        .sort(
+          (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+        )[0];
+    };
+    const profile = await readHead();
+    bound.throwIfAborted();
+    if (!profile)
+      throw new Error(
+        "Set up your Buzz profile before adding a receiving address",
+      );
+    const publish = transport?.updateReceivingAddress;
+    if (!publish) throw new Error("Receiving address updates unavailable");
+    const publishedId = await publish(address, profile, bound);
+    bound.throwIfAborted();
+    const saved = await readHead();
+    bound.throwIfAborted();
+    const metadata: unknown = saved ? JSON.parse(saved.content) : undefined;
+    if (
+      !saved ||
+      saved.id !== publishedId ||
+      !metadata ||
+      typeof metadata !== "object" ||
+      Array.isArray(metadata) ||
+      (address === null
+        ? Object.hasOwn(metadata, "lud16") || Object.hasOwn(metadata, "lud06")
+        : (metadata as Record<string, unknown>).lud16 !== address.trim())
+    )
+      throw new Error(
+        "Receiving address has not been confirmed by the relay. Check your profile before saving again.",
+      );
+  }
   const session = Object.freeze({
     artifactIncremental: transport?.artifactIncremental,
     memberAdditions,
@@ -2585,65 +2645,15 @@ export function createRelaySession(
     receivingAddress:
       transport?.updateReceivingAddress && !options.cachedOnly
         ? {
-            /** One publication, no automatic retry. Fresh reads enter the normal
-             * profile directory so mounted profiles observe the confirmed head. */
             async update(
               address: string,
               signal: AbortSignal,
             ): Promise<string> {
-              const viewer = transport.viewer;
-              if (!viewer) throw new Error("Profile identity is unavailable");
-              const bound = AbortSignal.any([
-                signal,
-                lifetime.signal,
-                AbortSignal.timeout(30000),
-              ]);
-              const filters = [
-                {
-                  kinds: [0],
-                  authors: [viewer],
-                  limit: 5,
-                  consistency: "strong" as const,
-                },
-              ];
-              const readHead = async () => {
-                const events = await finiteRead(
-                  filters,
-                  { signal: bound, fresh: true },
-                  (signal) => readVerified(filters, { signal, fresh: true }),
-                );
-                return events
-                  .filter(
-                    (event) => event.kind === 0 && event.pubkey === viewer,
-                  )
-                  .sort(
-                    (a, b) =>
-                      b.created_at - a.created_at || a.id.localeCompare(b.id),
-                  )[0];
-              };
-              const profile = await readHead();
-              bound.throwIfAborted();
-              if (!profile)
-                throw new Error(
-                  "Set up your Buzz profile before adding a receiving address",
-                );
-              const publish = transport.updateReceivingAddress;
-              if (!publish)
-                throw new Error("Receiving address updates unavailable");
-              const publishedId = await publish(address, profile, bound);
-              bound.throwIfAborted();
-              const saved = await readHead();
-              bound.throwIfAborted();
-              if (
-                !saved ||
-                saved.id !== publishedId ||
-                JSON.parse(saved.content).lud16 !== address.trim()
-              )
-                throw new Error(
-                  "Receiving address has not been confirmed by the relay. Check your profile before saving again.",
-                );
+              await updateReceivingAddress(address, signal);
               return address.trim();
             },
+            clear: (signal: AbortSignal) =>
+              updateReceivingAddress(null, signal),
           }
         : undefined,
     emoji: emoji.queries,

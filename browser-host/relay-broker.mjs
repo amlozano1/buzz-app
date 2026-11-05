@@ -1,5 +1,8 @@
 import { isSidebarPreferencesBatch } from "../src/features/relay/sidebar-preferences.ts";
-import { receivingProfileTemplate } from "../src/features/communities/receiving-profile.ts";
+import {
+  receivingProfileError,
+  receivingProfileTemplate,
+} from "../src/features/communities/receiving-profile.ts";
 import {
   assertReceivingProfileHead,
   editedProfileTemplate,
@@ -2738,9 +2741,11 @@ export function relayBrokerPlugin({
                 receivingProfileTemplate(filters, viewer),
                 key,
               );
-            } catch {
+            } catch (error) {
               return json(res, 400, {
-                error: "Receiving address update rejected",
+                error:
+                  receivingProfileError(error?.message) ??
+                  "Receiving address update rejected",
                 sent: false,
               });
             }

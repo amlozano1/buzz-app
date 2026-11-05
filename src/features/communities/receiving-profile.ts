@@ -1,8 +1,8 @@
 import { verifyEvent, type Event, type EventTemplate } from "nostr-tools/pure";
 import { nextProfileTimestamp } from "./profile-publication.ts";
 
-/** The host accepts an existing, own signed profile and one address, never an
- * arbitrary replacement document or a template for general identity signing. */
+/** The host accepts an existing, own signed profile and one address (or null to
+ * clear), never an arbitrary replacement document or general identity signing. */
 export function receivingProfileTemplate(
   input: unknown,
   viewer: string,
@@ -12,7 +12,8 @@ export function receivingProfileTemplate(
   const value = input as Record<string, unknown>;
   if (Object.keys(value).some((key) => !["address", "profile"].includes(key)))
     throw new Error("Invalid receiving profile update");
-  const address = receivingAddress(value.address);
+  const address =
+    value.address === null ? null : receivingAddress(value.address);
   const profile = value.profile as Event;
   if (
     profile?.kind !== 0 ||
@@ -33,7 +34,9 @@ export function receivingProfileTemplate(
   const metadata: unknown = JSON.parse(profile.content);
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
     throw new Error("Invalid profile metadata");
-  const next: Record<string, unknown> = { ...metadata, lud16: address };
+  const next: Record<string, unknown> = { ...metadata };
+  if (address === null) delete next.lud16;
+  else next.lud16 = address;
   delete next.lud06;
   const content = JSON.stringify(next);
   if (new TextEncoder().encode(content).length > 16000)
@@ -44,6 +47,24 @@ export function receivingProfileTemplate(
     tags: profile.tags,
     created_at: nextProfileTimestamp(profile.created_at),
   };
+}
+
+/** Only fixed host validation/conflict guidance may cross the browser boundary. */
+export function receivingProfileError(reason: unknown): string | undefined {
+  const known = [
+    "Invalid receiving profile update",
+    "Enter a Lightning address",
+    "Enter a valid Lightning address",
+    "A signed profile for this Buzz account is required",
+    "Invalid profile metadata",
+    "Profile too large",
+    "Your profile timestamp is ahead of this device's clock",
+    "A profile save is already in progress. Check your profile before saving again.",
+    "Your profile changed while saving. Check your profile before saving again.",
+  ];
+  return typeof reason === "string" && known.includes(reason)
+    ? reason
+    : undefined;
 }
 
 export function receivingAddress(value: unknown): string {

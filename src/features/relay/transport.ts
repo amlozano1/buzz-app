@@ -47,6 +47,7 @@ import {
 } from "./sidebar-preferences";
 import { createHostAdmission } from "./host-admission";
 import { relayOrigin } from "../communities/destination";
+import { receivingProfileError } from "../communities/receiving-profile";
 import {
   admittedApiRequest,
   ApiPaused,
@@ -89,10 +90,10 @@ export interface RelayWriter {
   ): Promise<string> | Promise<void>;
 }
 export interface ReadTransport {
-  /** Patches an own signed profile after a fresh head check. Returns the exact
-   * accepted event ID for readback. No arbitrary signer or automatic retry. */
+  /** Patches (or clears with null) an own signed profile after a fresh head check.
+   * Returns the exact accepted event ID. No arbitrary signer or automatic retry. */
   readonly updateReceivingAddress?: (
-    address: string,
+    address: string | null,
     profile: RelayEvent,
     signal: AbortSignal,
   ) => Promise<string>;
@@ -597,7 +598,7 @@ export async function connectBrokerTransport(
     ...(session.receivingAddress === true
       ? {
           async updateReceivingAddress(
-            address: string,
+            address: string | null,
             profile: RelayEvent,
             signal: AbortSignal,
           ) {
@@ -609,7 +610,21 @@ export async function connectBrokerTransport(
               signal,
             });
             if (!response.ok)
-              throw new Error((await readApiFailure(response)).error);
+              throw new Error(
+                (
+                  await readApiFailure(response, (body, status) => {
+                    const value = body as {
+                      error?: unknown;
+                      sent?: unknown;
+                    } | null;
+                    if (
+                      (status === 400 || status === 409) &&
+                      value?.sent === false
+                    )
+                      return receivingProfileError(value.error);
+                  })
+                ).error,
+              );
             const receipt = await response.json();
             if (
               receipt.accepted !== true ||

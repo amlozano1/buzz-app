@@ -42,6 +42,7 @@ it("rejects another author, forged metadata, invalid addresses, and arbitrary fi
     content: JSON.stringify({ name: "Sam" }),
   });
   for (const input of [
+    { profile },
     { address: TEST_RECEIVING_ADDRESS, profile: { ...profile, content: "{}" } },
     { address: TEST_RECEIVING_ADDRESS, profile, content: "{}" },
     { address: 5, profile },
@@ -55,3 +56,39 @@ it("rejects another author, forged metadata, invalid addresses, and arbitrary fi
     ),
   ).toThrow();
 });
+
+it("clears both receiving fields without changing other metadata or tags", () => {
+  const viewer = keypair();
+  const profile = signed(viewer, {
+    kind: 0,
+    tags: [["keep", "tag"]],
+    content: JSON.stringify({
+      name: "Sam",
+      custom: { keep: true },
+      lud16: TEST_RECEIVING_ADDRESS,
+      lud06: "legacy",
+    }),
+  });
+  const template = receivingProfileTemplate(
+    { address: null, profile },
+    viewer.pubkey,
+  );
+  expect(JSON.parse(template.content)).toEqual({
+    name: "Sam",
+    custom: { keep: true },
+  });
+  expect(template.tags).toEqual(profile.tags);
+  expect(template.created_at).toBeGreaterThan(profile.created_at);
+});
+
+it.each(["null", "[]", '"text"', "42", "true"])(
+  "keeps receiving updates strict for non-object metadata %s",
+  (content) => {
+    const viewer = keypair();
+    const profile = signed(viewer, { kind: 0, tags: [], content });
+    for (const address of [TEST_RECEIVING_ADDRESS, null])
+      expect(() =>
+        receivingProfileTemplate({ address, profile }, viewer.pubkey),
+      ).toThrow("Invalid profile metadata");
+  },
+);

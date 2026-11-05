@@ -1822,10 +1822,14 @@ For kind 30177 publication, follow the
 The [Profiles plugin](profiles.md) supplies read-only human/agent identity panels.
 On supporting hosts, `session.receivingAddress.update(address, signal)` updates
 the signed-in person's Lightning receiving address (`lud16`) in the current
-community. Feature-detect this optional capability. It reads the current verified
-profile, preserves other metadata and tags, removes the obsolete `lud06`, and
-requires an exact publication receipt followed by verified readback of that same
-event as the current profile head. A superseding head is unconfirmed even if its
+community. `session.receivingAddress.clear(signal)` removes both `lud16` and
+`lud06` through the same host-owned publication path. Feature-detect this optional
+capability and invoke either method only after an explicit user action; never
+write an address automatically on plugin setup, mount, or discovery. Both methods
+read the current verified profile, preserve other metadata and tags, and require
+an exact publication receipt followed by verified readback of that same event as
+the current profile head. Update removes the obsolete `lud06`; clear confirms that
+both receiving fields are absent. A superseding head is unconfirmed even if its
 address matches. Each host runtime rejects overlapping profile publications and
 rechecks the signed base after signing, before sending. An observed change fails
 without publication. This is not relay-side compare-and-swap: another device can

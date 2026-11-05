@@ -71,66 +71,112 @@ let hangUploads = false;
 let preparedResponse: (() => { status?: number; body: unknown }) | undefined;
 const owners: ReturnType<typeof createOutbox>[] = [];
 
-it("updates receiving through the native profile publisher, verifies readback, and rejects a mismatched receipt", async () => {
-  let profile = signed(viewer, {
-    kind: 0,
-    tags: [["keep", "tag"]],
-    created_at: 1700000000,
-    content: JSON.stringify({
-      name: "Sam",
-      display_name: "Different",
-      about: "Keep bio",
-      lud06: "old",
-    }),
-  });
-  let confirm = true;
-  respond = (request) => {
-    if (request.path === "/query") return { body: [profile] };
-    if (request.path === "/events") {
-      profile = JSON.parse(request.body ?? "null");
-      return {
-        body: { accepted: true, event_id: confirm ? profile.id : "unrelated" },
-      };
-    }
-    return { body: [] };
-  };
-  const transport = await connectNativeTransport(community);
-  const store = createRelaySession(transport);
-  try {
-    expect(store.session.outbox?.supports(0)).toBe(false);
-    await expect(
-      store.session.receivingAddress?.update(
-        TEST_RECEIVING_ADDRESS,
-        new AbortController().signal,
-      ),
-    ).resolves.toBe(TEST_RECEIVING_ADDRESS);
-    expect(verifyEvent(profile)).toBe(true);
-    expect(profile.pubkey).toBe(viewer.pubkey);
-    expect(profile.tags).toEqual([["keep", "tag"]]);
-    expect(
-      JSON.parse(
-        store.session.profiles.event?.(viewer.pubkey)?.content ?? "null",
-      ),
-    ).toEqual({
-      name: "Sam",
-      display_name: "Different",
-      about: "Keep bio",
-      lud16: TEST_RECEIVING_ADDRESS,
+it.each(["update", "clear"] as const)(
+  "%s receiving through the native profile publisher, verifies readback, and rejects a mismatched receipt",
+  async (operation) => {
+    let profile = signed(viewer, {
+      kind: 0,
+      tags: [["keep", "tag"]],
+      created_at: 1700000000,
+      content: JSON.stringify({
+        name: "Sam",
+        display_name: "Different",
+        about: "Keep bio",
+        lud06: "old",
+        lud16: TEST_UPDATED_RECEIVING_ADDRESS,
+      }),
     });
-    confirm = false;
-    await expect(
-      store.session.receivingAddress?.update(
-        TEST_UPDATED_RECEIVING_ADDRESS,
-        new AbortController().signal,
-      ),
-    ).rejects.toThrow("not confirmed");
-    expect(
-      requests.filter((request) => request.path === "/events"),
-    ).toHaveLength(2);
-  } finally {
-    store.dispose();
-  }
-});
+    let confirm = true;
+    respond = (request) => {
+      if (request.path === "/query") return { body: [profile] };
+      if (request.path === "/events") {
+        profile = JSON.parse(request.body ?? "null");
+        return {
+          body: {
+            accepted: true,
+            event_id: confirm ? profile.id : "unrelated",
+          },
+        };
+      }
+      return { body: [] };
+    };
+    const transport = await connectNativeTransport(community);
+    const store = createRelaySession(transport);
+    try {
+      expect(store.session.outbox?.supports(0)).toBe(false);
+      assert(store.session.receivingAddress);
+      const signal = new AbortController().signal;
+      await expect(
+        operation === "clear"
+          ? store.session.receivingAddress.clear(signal)
+          : store.session.receivingAddress.update(
+              TEST_RECEIVING_ADDRESS,
+              signal,
+            ),
+      ).resolves.toBe(
+        operation === "clear" ? undefined : TEST_RECEIVING_ADDRESS,
+      );
+      expect(verifyEvent(profile)).toBe(true);
+      expect(profile.pubkey).toBe(viewer.pubkey);
+      expect(profile.tags).toEqual([["keep", "tag"]]);
+      expect(
+        JSON.parse(
+          store.session.profiles.event?.(viewer.pubkey)?.content ?? "null",
+        ),
+      ).toEqual({
+        name: "Sam",
+        display_name: "Different",
+        about: "Keep bio",
+        ...(operation === "update" ? { lud16: TEST_RECEIVING_ADDRESS } : {}),
+      });
+      confirm = false;
+      await expect(
+        operation === "clear"
+          ? store.session.receivingAddress.clear(new AbortController().signal)
+          : store.session.receivingAddress.update(
+              TEST_UPDATED_RECEIVING_ADDRESS,
+              new AbortController().signal,
+            ),
+      ).rejects.toThrow("not confirmed");
+      expect(
+        requests.filter((request) => request.path === "/events"),
+      ).toHaveLength(2);
+    } finally {
+      store.dispose();
+    }
+  },
+);
+it.each(["null", "[]", '"text"', "42", "true"])(
+  "native profile editor repairs signed non-object metadata %s",
+  async (content) => {
+    const original = signed(viewer, {
+      kind: 0,
+      tags: [["keep", "tag"]],
+      content,
+    });
+    let head = original;
+    respond = (request) => {
+      if (request.path === "/query") return { body: [head] };
+      head = JSON.parse(request.body ?? "null");
+      return { body: { accepted: true, event_id: head.id } };
+    };
+    await nativeCommunityRequest(community, "profile", {
+      name: "Repaired",
+      picture: "",
+      about: "New bio",
+    });
+    expect(verifyEvent(head)).toBe(true);
+    expect(JSON.parse(head.content)).toEqual({
+      name: "Repaired",
+      display_name: "Repaired",
+      picture: "",
+      about: "New bio",
+    });
+    expect(head.tags).toEqual(original.tags);
+    expect(head.created_at).toBeGreaterThan(original.created_at);
+  },
+);
+
 it("rejects a changed profile after signing and excludes overlapping native profile writers", async () => {
   const original = signed(viewer, {
     kind: 0,

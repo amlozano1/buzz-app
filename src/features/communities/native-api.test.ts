@@ -269,11 +269,7 @@ it("restores a signed community profile and preserves extra fields when publishi
     picture: "",
     about: "About",
   });
-  await publishProfile(
-    community,
-    { ...found.profile, name: "Updated" },
-    found.existing,
-  );
+  await publishProfile(community, { ...found.profile, name: "Updated" });
   const published = requests.find((r) => r.path === "/events")?.body as {
     content: string;
     pubkey: string;
@@ -290,9 +286,9 @@ it("restores a signed community profile and preserves extra fields when publishi
     path === "/query"
       ? { body: [event] }
       : { body: { accepted: true, event_id: "unrelated" } };
-  await expect(
-    publishProfile(community, found.profile, found.existing),
-  ).rejects.toThrow("not confirmed");
+  await expect(publishProfile(community, found.profile)).rejects.toThrow(
+    "not confirmed",
+  );
 });
 
 it("signs the NIP-43 leave request for the community and classifies the relay's answer", async () => {
