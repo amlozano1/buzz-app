@@ -31,6 +31,13 @@ export type PluginManifest = Readonly<{
       maxInputBytes?: number;
       /** Maximum UTF-8 stdout bytes; defaults to 4096, bounded at 1048576. */
       maxOutputBytes?: number;
+      /** Run an installed executable only when its bytes and declared sibling
+       * files match this descriptor, never a program found on PATH. */
+      artifact?: Readonly<{
+        path: string;
+        sha256: string;
+        siblings?: readonly Readonly<{ name: string; sha256: string }>[];
+      }>;
     }>[];
     networkOrigins?: readonly string[];
     /** Separate authority access; ordinary HTTPS grants never authorize a session. */
@@ -65,6 +72,10 @@ export type PluginManifest = Readonly<{
     files?: boolean;
     /** Pathless temporary saves in host-selected private storage; no read access. */
     managedFiles?: boolean;
+    /** `host.requestBytes` may also read raster images from any public HTTPS
+     * address, one hop at a time with no cookies, outside `networkOrigins`.
+     * Redirects and pages come back without a body. */
+    publicImages?: boolean;
   }>;
 }>;
 // Module evaluation must be pure. apply owns resources through ctx.effect.

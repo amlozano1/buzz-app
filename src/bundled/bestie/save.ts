@@ -13,7 +13,10 @@ import {
   withFeature,
 } from "./features";
 
-export type FeatureAgents = Pick<Agents, "save" | "types">;
+/** What saving a feature needs. A caller of agents here only can leave out
+ * `hostedInstructions`. */
+export type FeatureAgents = Pick<Agents, "save" | "types"> &
+  Partial<Pick<Agents, "hostedInstructions">>;
 
 /** The agent's instructions, as its synced editor shows them. */
 export function instructionsOf(agent: Agent) {
@@ -21,11 +24,24 @@ export function instructionsOf(agent: Agent) {
   return typeof instructions === "string" ? instructions : "";
 }
 
-/** Why the agent's instructions can't take a feature here, if they can't. */
-export function cannotEdit(agents: FeatureAgents, agent: Agent) {
+/** Why the agent's instructions can't take a feature here, if they can't.
+ * `feature` is the one to add, which a hosted agent's provider may take if it
+ * has no timer; without it, only an agent here can be edited. */
+export function cannotEdit(
+  agents: FeatureAgents,
+  agent: Agent,
+  feature?: Feature,
+) {
   // A remote agent's instructions and timers aren't on this device: its
-  // provider, or the device it runs on, holds them.
-  if (agent.place !== "here") return "Not available with remote agents yet.";
+  // provider, or the device it runs on, holds them. A hosted agent's provider
+  // may let its instructions be edited, but its timers never run here.
+  if (agent.place !== "here")
+    return agent.place === "hosted" &&
+      feature &&
+      !feature.timer &&
+      agents.hostedInstructions?.(agent.pubkey)
+      ? undefined
+      : "Not available with remote agents yet.";
   // A type without `adopt` has no instructions, as `updateKind` says.
   if (!agents.types().find(({ key }) => key === agent.type)?.adopt)
     return "This agent's type has no instructions to add this to.";
@@ -105,12 +121,7 @@ export async function saveFeature(
     };
   }
   if (Object.keys(attention).length)
-    await agents.save(agent.key, {
-      attention,
-      // Its timer runs only while the agent's Attention is on. Off leaves it
-      // on: the agent's other watches may need it.
-      ...(timer && { attentionEnabled: true }),
-    });
+    await agents.save(agent.key, { attention });
   if (timerOnly) return;
   const instructions = instructionsOf(agent);
   const next = on
@@ -123,7 +134,7 @@ export async function saveFeature(
     await saveInstructions(agents, agent, next);
   } catch (cause) {
     // A failed On undoes what it saved, so no timer runs behind a switch
-    // that reads off. Attention goes back off only if this turned it on.
+    // that reads off.
     if (timer)
       await agents
         .save(agent.key, {
@@ -133,7 +144,6 @@ export async function saveFeature(
               agent.attention[slug]?.value ?? null,
             ]),
           ),
-          ...(!agent.attentionEnabled && { attentionEnabled: false }),
         })
         .catch(() => {
           throw new Error(
@@ -157,12 +167,19 @@ export async function restoreFeature(
   await saveInstructions(agents, agent, next);
 }
 
-/** Saves `instructions` as the next revision of the copy `agent` shows. */
+/** Saves `instructions` as the next revision of the copy `agent` shows, or,
+ * for a hosted agent, through its provider. */
 function saveInstructions(
   agents: FeatureAgents,
   agent: Agent,
   instructions: string,
 ) {
+  if (agent.place === "hosted") {
+    const hosted = agents.hostedInstructions?.(agent.pubkey);
+    if (!hosted) throw new Error("Not available with remote agents yet.");
+    // Its provider replaces the copy this switch shows, never a newer one.
+    return hosted.set(instructions, instructionsOf(agent));
+  }
   return agents.save(agent.key, {
     config: { ...(agent.config as object), instructions },
     ...(agent.configBase && { base: agent.configBase }),

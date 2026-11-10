@@ -1,3 +1,4 @@
+import { messageAuthor } from "../features/relay/fold";
 // The Buzz tools: what an agent does in Buzz, in the wire formats the `buzz`
 // CLI writes. Names, arguments and descriptions are kept short because every
 // session pays for them in context. Each tool answers in plain text.
@@ -28,6 +29,13 @@ import {
   referencedEmoji,
 } from "../features/relay/emoji";
 import { newer } from "../features/relay/events";
+import {
+  VERIFIED_PROFILE_BATCH,
+  type VerifiedProfile,
+  verifiedProfile,
+  verifiedProfileFilter,
+  verifiedProfileSubject,
+} from "../features/relay/verified-profile";
 import { imageType } from "../features/relay/attachment-limits";
 import { LIVE_CANVAS_BYTES } from "../features/channel-templates/model";
 import { threadReference } from "../features/relay/thread-reference";
@@ -56,6 +64,11 @@ const audience = {
   enum: ["everyone", "agents"],
   description:
     "agents: only other agents need this (delegating, asking or answering an agent)",
+} as const;
+const request = {
+  type: "string",
+  description:
+    "Id of the message that started this turn, which this post answers or works on, even when the reply targets an earlier thread root.",
 } as const;
 const final = {
   type: "boolean",
@@ -138,8 +151,8 @@ export const TOOLS: readonly Tool[] = [
   ),
   tool(
     "agent_create",
-    "Submit an unsaved agent-creation draft for your owner to review. Nothing is created until they save it. Use a type key from agent_types; picture is a local image file for its avatar.",
-    { type: str, name: str, picture: str },
+    "Submit an unsaved agent-creation draft for your owner to review. Nothing is created until they save it. Use a type key from agent_types; instructions are optional; picture is a local image file for its avatar.",
+    { type: str, name: str, instructions: str, picture: str },
     ["type", "name"],
   ),
   tool(
@@ -147,6 +160,22 @@ export const TOOLS: readonly Tool[] = [
     "Submit an unsaved draft of changes to one of your owner's agents, yourself included, for them to review. agent is its pubkey or exact name; type is a key from agent_types; picture is a local image file for its avatar. Nothing changes until they save it.",
     { agent: str, name: str, type: str, instructions: str, picture: str },
     ["agent"],
+  ),
+  tool(
+    "agent_read",
+    "Read one of your owner's agents here, yourself included: name, type, instructions, whether they sync and their current revision; a hosted agent or one on another device says its config is unavailable when it can't be read here. agent is its pubkey or exact name; without it, lists them all.",
+    { agent: str },
+  ),
+  tool(
+    "team_read",
+    "Read one of your owner's teams here: name, instructions, members, whether it syncs and its current revision. team is its id or exact name; without it, lists them all.",
+    { team: str },
+  ),
+  tool(
+    "team_update",
+    "Submit an unsaved draft of a new name or instructions for one of your owner's teams, for them to review. team is its id or exact name. Members never change this way. Nothing changes until they save it.",
+    { team: str, name: str, instructions: str },
+    ["team"],
   ),
   tool(
     "send",
@@ -159,13 +188,14 @@ export const TOOLS: readonly Tool[] = [
       files: strs,
       mentions: strs,
       audience,
+      request,
       final,
     },
     ["audience"],
   ),
   tool(
     "reply_in_subthread",
-    "Reply under a specific message, nested in a subthread below it rather than in the main thread. Use when asked to reply in a subthread, or to keep a side discussion under the message it is about. Takes send's text, path, files, mentions, audience and final; the channel is the parent's.",
+    "Reply under a specific message, nested in a subthread below it rather than in the main thread. Use when asked to reply in a subthread, or to keep a side discussion under the message it is about. Takes send's text, path, files, mentions, audience, request and final; the channel is the parent's.",
     {
       parent: { ...str, description: "Id of the message to reply under" },
       text: str,
@@ -173,6 +203,7 @@ export const TOOLS: readonly Tool[] = [
       files: strs,
       mentions: strs,
       audience,
+      request,
       final,
     },
     ["parent", "audience"],
@@ -463,9 +494,15 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const type = text(args.type)?.trim();
     const name = text(args.name)?.trim();
     if (!type || !name) throw new Error("type and name are required");
+    const instructions = text(args.instructions);
     const picture = proposedPicture(client, args.picture);
     return JSON.stringify(
-      await client.createAgent({ type, name, ...(picture && { picture }) }),
+      await client.createAgent({
+        type,
+        name,
+        ...(instructions && { instructions }),
+        ...(picture && { picture }),
+      }),
     );
   },
   async self_handoff(tools, args) {
@@ -526,8 +563,35 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
       }),
     );
   },
+  async agent_read({ client }, args) {
+    if (!client.readAgents)
+      throw new Error("Agent reads are unavailable on this host");
+    return JSON.stringify(await client.readAgents(text(args.agent)));
+  },
+  async team_read({ client }, args) {
+    if (!client.readTeams)
+      throw new Error("Team reads are unavailable on this host");
+    return JSON.stringify(await client.readTeams(text(args.team)));
+  },
+  async team_update({ client }, args) {
+    if (!client.updateTeam)
+      throw new Error("Team changes are unavailable on this host");
+    const team = text(args.team);
+    if (!team) throw new Error("team is required");
+    const name = text(args.name);
+    // Empty instructions propose clearing them.
+    const { instructions } = args;
+    return JSON.stringify(
+      await client.updateTeam({
+        team,
+        ...(name && { name }),
+        ...(typeof instructions === "string" && { instructions }),
+      }),
+    );
+  },
   async send(tools, args) {
     const { context } = tools;
+    args = ignoreBlankFields(args, ["channel", "reply"]);
     const reply =
       text(args.reply) ??
       (args.channel === undefined ? context.root : undefined);
@@ -543,7 +607,7 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
       throw new Error(
         "This chat stays at the top level: send again without reply.",
       );
-    const audienceTags = audienceOf(args);
+    const audienceTags = [...audienceOf(args), ...requestOf(args)];
     const thread = reply ? await tools.threadTags(reply) : [];
     return post(tools, channel, args, thread, audienceTags);
   },
@@ -558,7 +622,7 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     if (!channel) throw new Error("No channel for that message.");
     if (context.topLevel && channel === context.channel)
       throw new Error("This chat stays at the top level: use send instead.");
-    const audienceTags = audienceOf(args);
+    const audienceTags = [...audienceOf(args), ...requestOf(args)];
     // As relay ingest reads it: the last valid marker, in either case.
     const root = target
       ? (threadReference(target)?.rootId ?? target.id)
@@ -583,14 +647,23 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const channel = tag(target, "h");
     if (!channel) throw new Error(`${id} is not a channel message.`);
     const content = required(args, "text");
+    if (!tools.client.effectiveEdit)
+      throw new Error("This host cannot obtain effective edit state.");
+    const effective = await tools.client.effectiveEdit(id, channel);
+    const after = (effective.created_at + 1) * 1000;
+    if (after - Date.now() > 5000)
+      throw new Error(
+        "The message was just changed; try again when the clock catches up.",
+      );
+    await waitUntil(after);
     await tools.client.publish({
       kind: 40003,
       content,
-      // An edit replaces the attachments too, so it keeps the message's.
+      // An edit replaces attachments too, including an explicitly empty set.
       tags: [
         ["h", channel],
         ["e", id],
-        ...target.tags.filter((t) => t[0] === "imeta"),
+        ...effective.tags.filter((t) => t[0] === "imeta"),
         ...(await tools.emoji(content)),
       ],
     });
@@ -622,7 +695,21 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
     const id = required(args, "id");
     const emoji = required(args, "emoji");
     if (args.off !== true) {
-      await client.publish({ kind: 7, content: emoji, tags: [["e", id]] });
+      const target = await tools.event(id);
+      await client.publish({
+        kind: 7,
+        content: emoji,
+        tags: [
+          ["e", id],
+          [
+            "p",
+            messageAuthor(
+              { ...target, tags: target.tags.map((tag) => [...tag]) },
+              client.signingAuthority,
+            ),
+          ],
+        ],
+      });
       return "reacted";
     }
     const mine = await client.query([
@@ -636,6 +723,13 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
 
   async read(tools, args) {
     const { client, context } = tools;
+    args = ignoreBlankFields(args, [
+      "channel",
+      "thread",
+      "message_url",
+      "author",
+      "before_id",
+    ]);
     if (args.message_url !== undefined) {
       if (args.channel !== undefined || args.thread !== undefined)
         throw new Error(
@@ -1489,6 +1583,15 @@ const HANDLERS: Readonly<Record<string, Handler>> = {
   },
 };
 
+/** The signed request a post belongs to: the turn's triggering message,
+ * which a thread reply's flattened reply link cannot name. */
+function requestOf(args: Args): string[][] {
+  if (args.request === undefined) return [];
+  const id = text(args.request)?.toLowerCase();
+  if (!id || !HEX.test(id)) throw new Error(`Not an event id: ${args.request}`);
+  return [["buzz:request", id]];
+}
+
 /** The tags for a message's required audience. */
 function audienceOf(args: Args): string[][] {
   if (args.audience !== "everyone" && args.audience !== "agents")
@@ -1946,6 +2049,76 @@ class Tools {
     return names;
   }
 
+  /** Every name `send` accepts after `@` for each of `pubkeys`, with its
+   * weight: lower wins when people share a name. A relay-verified name
+   * outranks a name someone gave their own profile, so a profile cannot take
+   * a verified person's name. */
+  async aliases(pubkeys: readonly string[]) {
+    const wanted = [...new Set(pubkeys)];
+    const aliases = new Map<string, Map<string, number>>();
+    const add = (pubkey: string, name: unknown, weight: number) => {
+      if (typeof name !== "string" || !name.trim()) return;
+      const lower = name.trim().toLowerCase();
+      const names = aliases.get(lower) ?? new Map<string, number>();
+      names.set(pubkey, Math.min(names.get(pubkey) ?? weight, weight));
+      aliases.set(lower, names);
+    };
+    if (!wanted.length) return aliases;
+    const profiles = await this.client.query([
+      { kinds: [0], authors: wanted, limit: wanted.length },
+    ]);
+    for (const event of newest(profiles)) {
+      const profile = parse(event.content);
+      add(event.pubkey, profile.display_name, NAME_WEIGHT.displayName);
+      add(event.pubkey, profile.name, NAME_WEIGHT.name);
+    }
+    for (const [pubkey, verified] of await this.verifiedNames(wanted)) {
+      add(pubkey, verified.displayName, NAME_WEIGHT.verifiedDisplayName);
+      add(pubkey, verified.username, NAME_WEIGHT.verifiedUsername);
+      add(pubkey, verified.fullName, NAME_WEIGHT.verifiedFullName);
+    }
+    return aliases;
+  }
+
+  /** The relay's verified names (kind 30382) for `pubkeys`, read as the app
+   * reads them, so `send` and the app agree on who is verified. None without
+   * the connection's relay key. */
+  async verifiedNames(pubkeys: readonly string[]) {
+    const names = new Map<string, VerifiedProfile>();
+    const relay = this.client.relayAuthor;
+    if (!relay || !HEX_KEY.test(relay)) return names;
+    const authority = { pubkey: relay, multipleIssuers: false };
+    const subjects = [...new Set(pubkeys)].filter((key) => HEX_KEY.test(key));
+    const batches: string[][] = [];
+    for (let at = 0; at < subjects.length; at += VERIFIED_PROFILE_BATCH)
+      batches.push(subjects.slice(at, at + VERIFIED_PROFILE_BATCH));
+    const found = (
+      await Promise.all(
+        batches.map((batch) =>
+          this.client
+            .query([verifiedProfileFilter(relay, batch)])
+            .catch(() => []),
+        ),
+      )
+    ).flat();
+    // The newest event at each address decides; a newer malformed or
+    // retracted one leaves the person unverified, as in the app.
+    const latest = new Map<string, RelayEvent>();
+    for (const item of found) {
+      // Queries admit the events whose signatures they checked; the app's
+      // projection takes only those.
+      const event = item as unknown as RelayEvent;
+      const subject = verifiedProfileSubject(event, authority);
+      if (!subject || !subjects.includes(subject)) continue;
+      latest.set(subject, newer(latest.get(subject), event));
+    }
+    for (const [subject, event] of latest) {
+      const verified = verifiedProfile(event, authority, true);
+      if (verified) names.set(subject, verified);
+    }
+    return names;
+  }
+
   /** Messages oldest first with their latest edits, a line each: its ID,
    * author and its claimed (unverified) agent owner, channel and thread,
    * omitting what `scope` names. Other agent read surfaces trim the same
@@ -1962,27 +2135,9 @@ class Tools {
       : [];
     const messages = edited([...events, ...edits]);
     const names = await this.names(messages.map((event) => event.pubkey));
-    return messages.map((event) => {
-      const name = names.get(event.pubkey);
-      const channel = tag(event, "h");
-      const owner = tag(event, "auth");
-      const reference = threadReference(event);
-      const thread = reference?.rootId;
-      return [
-        event.id,
-        `from ${event.pubkey}`,
-        name && JSON.stringify(name),
-        owner && `claimed owner ${owner}`,
-        channel && channel !== scope.channel && `in ${channel}`,
-        thread && thread !== scope.root && `re ${thread}`,
-        reference &&
-          reference.parentId !== thread &&
-          `reply_to ${reference.parentId}`,
-        `at ${time(event.created_at)}: ${event.content}`,
-      ]
-        .filter(Boolean)
-        .join(" ");
-    });
+    return messages.map((event) =>
+      messageLine(event, names.get(event.pubkey), scope),
+    );
   }
 
   /** NIP-30 tags for the community emoji `content` uses, as the composer
@@ -2013,13 +2168,7 @@ class Tools {
     if (!prose.includes("@") && !keys.size) return [];
     const members = await this.members(channel);
     if (prose.includes("@")) {
-      const byName = new Map<string, string[]>();
-      for (const [key, name] of await this.names(
-        members.map((member) => member.pubkey),
-      )) {
-        const lower = name.toLowerCase();
-        byName.set(lower, [...(byName.get(lower) ?? []), key]);
-      }
+      const byName = await this.aliases(members.map((member) => member.pubkey));
       const longest = [...byName.keys()].sort((a, b) => b.length - a.length);
       const unknown: string[] = [];
       for (const match of prose.matchAll(/(^|\s)@/g)) {
@@ -2031,7 +2180,7 @@ class Tools {
             rest.startsWith(candidate) &&
             /^($|[\s,;.!?:)\]}])/.test(rest.slice(candidate.length)),
         );
-        const found = name ? (byName.get(name) ?? []) : [];
+        const found = name ? bestNamed(byName.get(name)) : [];
         if (found.length === 1) keys.add(found[0] as string);
         else {
           const token = name ?? rest.match(/^[a-z0-9._-]+/)?.[0];
@@ -2071,6 +2220,32 @@ class Tools {
   }
 }
 
+/** A message's line in a read, omitting what `scope` names. */
+function messageLine(
+  event: BuzzEvent,
+  name: string | undefined,
+  scope: Readonly<{ channel?: string; root?: string }>,
+) {
+  const channel = tag(event, "h");
+  const owner = tag(event, "auth");
+  const reference = threadReference(event);
+  const thread = reference?.rootId;
+  return [
+    event.id,
+    `from ${event.pubkey}`,
+    name && JSON.stringify(name),
+    owner && `claimed owner ${owner}`,
+    channel && channel !== scope.channel && `in ${channel}`,
+    thread && thread !== scope.root && `re ${thread}`,
+    reference &&
+      reference.parentId !== thread &&
+      `reply_to ${reference.parentId}`,
+    `at ${time(event.created_at)}: ${event.content}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 /** The root of the thread `event` is in, by its NIP-10 markers. */
 function rootOf(event: BuzzEvent) {
   const tags = event.tags.filter(
@@ -2083,21 +2258,26 @@ function rootOf(event: BuzzEvent) {
 
 /** Messages oldest first, each showing its author's latest edit. */
 function edited(events: readonly BuzzEvent[]) {
+  const messages = events.filter((event) => event.kind !== 40003);
+  const byId = new Map(messages.map((event) => [event.id, event]));
   const edits = new Map<string, BuzzEvent>();
   for (const event of events)
     if (event.kind === 40003) {
       const target = tag(event, "e");
+      const message = target ? byId.get(target) : undefined;
       const last = target && edits.get(target);
-      if (target && (!last || last.created_at < event.created_at))
+      // Authorship first, so someone else's newer edit hides none.
+      if (
+        target &&
+        message?.pubkey === event.pubkey &&
+        (!last || last.created_at < event.created_at)
+      )
         edits.set(target, event);
     }
-  return events
-    .filter((event) => event.kind !== 40003)
+  return messages
     .map((event) => {
       const edit = edits.get(event.id);
-      return edit && edit.pubkey === event.pubkey
-        ? { ...event, content: edit.content }
-        : event;
+      return edit ? { ...event, content: edit.content } : event;
     })
     .sort((a, b) => a.created_at - b.created_at);
 }
@@ -2270,6 +2450,28 @@ function pubkey(value: string) {
     if (decoded.type === "npub") return decoded.data;
   } catch {}
   throw new Error(`Not a pubkey: ${value}`);
+}
+
+/** How strongly each kind of name claims a person for `@`: lower wins. A
+ * verified username comes first, and every name the relay verified outranks
+ * every name a person gave themselves. */
+const NAME_WEIGHT = {
+  verifiedUsername: 0,
+  verifiedDisplayName: 1,
+  verifiedFullName: 2,
+  displayName: 3,
+  name: 4,
+} as const;
+
+const HEX_KEY = /^[0-9a-f]{64}$/;
+
+/** Who a name tags: everyone holding it in its strongest form. */
+function bestNamed(holders: ReadonlyMap<string, number> | undefined) {
+  if (!holders?.size) return [];
+  const best = Math.min(...holders.values());
+  return [...holders]
+    .filter(([, weight]) => weight === best)
+    .map(([key]) => key);
 }
 
 const profileName = (profile: Record<string, unknown>) =>
@@ -2545,7 +2747,8 @@ function joinRoleArg(args: Args) {
 /** A `since` or `before` argument: a Unix time in seconds, inclusive. */
 function unixTime(args: Args, key: string) {
   const value = args[key];
-  if (value === undefined) return undefined;
+  // 0 is left out too: no message is from before 1970.
+  if (value === undefined || value === 0) return undefined;
   // In milliseconds, a time from this century is past the year 5000.
   if (
     !Number.isSafeInteger(value) ||
@@ -2571,6 +2774,15 @@ function checkDetails(name?: string, about?: string, ttl?: number) {
 }
 const text = (value: unknown) =>
   typeof value === "string" && value.trim() ? value.trim() : undefined;
+const isBlank = (value: unknown) => typeof value === "string" && !value.trim();
+/** Some models fill in every optional field, sending "" for each one they
+ * mean to leave out. Reads a blank one of `fields` as left out. */
+function ignoreBlankFields(args: Args, fields: readonly string[]): Args {
+  const checked = { ...args };
+  for (const field of fields)
+    if (isBlank(checked[field])) delete checked[field];
+  return checked;
+}
 const list = (value: unknown) =>
   Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")

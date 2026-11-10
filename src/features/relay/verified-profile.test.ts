@@ -16,7 +16,12 @@ const relay = keypair();
 const alice = keypair();
 const bob = keypair();
 const authority = { pubkey: relay.pubkey, multipleIssuers: true };
-function projection(at = 10, subject = alice.pubkey, extra: string[][] = []) {
+function projection(
+  at = 10,
+  subject = alice.pubkey,
+  extra: string[][] = [],
+  name = "Alice",
+) {
   return eventDto(
     signed(relay, {
       kind: 30382,
@@ -26,7 +31,7 @@ function projection(at = 10, subject = alice.pubkey, extra: string[][] = []) {
         ["d", subject],
         ["p", subject],
         ["active", "true"],
-        ["display_name", "Alice"],
+        ["display_name", name],
         ["username", "alice"],
         ["issuer_label", "Example"],
         ["verified_at", String(at)],
@@ -173,6 +178,7 @@ function harness(
 ) {
   const subscriptions: {
     subjects: readonly string[];
+    since: number | undefined;
     sink: VerifiedProfileSink;
     stopped: boolean;
   }[] = [];
@@ -182,7 +188,12 @@ function harness(
     (filter, sink) => {
       expect(filter.limit).toBe(filter["#d"].length);
       expect(filter).not.toHaveProperty("#p"); // malformed p must still invalidate the address
-      const item = { subjects: filter["#d"], sink, stopped: false };
+      const item = {
+        subjects: filter["#d"],
+        since: filter.since,
+        sink,
+        stopped: false,
+      };
       subscriptions.push(item);
       return () => {
         item.stopped = true;
@@ -299,21 +310,42 @@ it("does not re-send a batch an outage ended", async () => {
     assert(first);
     first.sink.event(projection());
     first.sink.eose();
-    // An outage ends the sync, then reports the connection down.
-    first.sink.closed("disconnected: live connection lost");
+    // An outage ends the sync, with the socket's resume point, then reports
+    // the connection down in the same task.
+    first.sink.closed("disconnected: live connection lost", { since: 500 });
     h.directory.connected(false);
     await Promise.resolve();
     expect(h.subscriptions).toHaveLength(1);
     expect(h.directory.snapshot().get(alice.pubkey)?.status).toBe("cached");
     h.directory.connected(true);
     await Promise.resolve();
-    expect(h.subscriptions.filter((item) => !item.stopped)).toHaveLength(1);
+    const active = h.subscriptions.filter((item) => !item.stopped);
+    expect(active).toHaveLength(1);
+    // Recovery re-reads every head.
+    expect(active[0]?.since).toBeUndefined();
   } finally {
     h.directory.dispose();
   }
 });
 
-it("overlays verified names, qualifies collisions, preserves kind 0 details, and restores them on retraction", async () => {
+it.each([
+  ["Alice", "Alice"],
+  ["Alice", "Alice "],
+  ["Alice", "\u00a0Alice\u3000"],
+  ["Alice", "Al\u200bice"],
+  ["Alice", "Alice \u200b"],
+  ["Alice", "\u200b Alice"],
+  ["Alice", "Al\u00adice"],
+  ["Alice", "Al\u034fice"],
+  ["Alice", "Alice\u200d"],
+  ["Alice", "Alice\ufe0f"],
+  ["Alice", "Alice\u{e0061}"],
+  ["Alice", "Alice\u3164"],
+  ["Alice\u034f", "Alice"],
+  ["Alice \ufe0f", "Alice"],
+  ["Alice 😀", "Alice 😀\ufe0f"],
+  ["Alice 😀\ufe0f", "Alice 😀"],
+])("qualifies %j against %j", async (verifiedName, claimedName) => {
   const { createProfileDirectory } = await import("./profile-directory");
   let sink: VerifiedProfileSink | undefined;
   const directory = createProfileDirectory(
@@ -345,23 +377,31 @@ it("overlays verified names, qualifies collisions, preserves kind 0 details, and
         signed(bob, {
           kind: 0,
           tags: [],
-          content: JSON.stringify({ name: "Alice" }),
+          content: JSON.stringify({ name: claimedName }),
         }),
       ),
     ]);
     await directory.ensure([alice.pubkey, bob.pubkey]);
     assert(sink);
-    sink.event(projection());
+    sink.event(projection(10, alice.pubkey, [], verifiedName));
     sink.eose();
     await tick(); // Verified changes publish on the next macrotask.
     const profile = directory.queries.snapshot().get(alice.pubkey);
-    expect(profile?.name).toBe("Alice");
+    expect(profile?.name).toBe(verifiedName);
     expect(profile?.about).toBe("About Alice");
     expect(profile?.picture).toBe("https://example.test/alice.png");
     expect(profile?.verified?.status).toBe("checked");
     expect(directory.queries.snapshot().get(bob.pubkey)?.name).toContain(
       bob.pubkey.slice(0, 10),
     );
+    expect(directory.queries.snapshot().get(bob.pubkey)?.name).toBe(
+      `${claimedName.trim()} (${bob.pubkey.slice(0, 10)})`,
+    );
+    expect(
+      JSON.parse(directory.queries.event?.(bob.pubkey)?.content ?? "{}"),
+    ).toEqual({
+      name: claimedName,
+    });
     sink.event(retract(20));
     await tick(); // Verified changes publish on the next macrotask.
     expect(directory.queries.snapshot().get(alice.pubkey)?.name).toBe(
@@ -370,6 +410,9 @@ it("overlays verified names, qualifies collisions, preserves kind 0 details, and
     expect(
       directory.queries.snapshot().get(alice.pubkey)?.verified,
     ).toBeUndefined();
+    expect(directory.queries.snapshot().get(bob.pubkey)?.name).toBe(
+      claimedName.trim(),
+    );
   } finally {
     directory.dispose();
   }
@@ -1153,5 +1196,107 @@ it("notifies profile subscribers when discovery withdraws the authority, even wi
   } finally {
     owner.dispose();
     vi.useRealTimers();
+  }
+});
+
+it("resumes a renewed batch from its cursor and reads an omitted subject as unchanged", async () => {
+  const h = harness();
+  const active = () => h.subscriptions.filter((item) => !item.stopped);
+  try {
+    h.directory.ensure([alice.pubkey, bob.pubkey]);
+    await Promise.resolve();
+    const first = active()[0];
+    assert(first);
+    expect(first.since).toBeUndefined();
+    first.sink.event(projection());
+    first.sink.event(projection(10, bob.pubkey));
+    first.sink.eose();
+    const shown = h.directory.snapshot();
+    h.changed.mockClear();
+    first.sink.closed("disconnected: live connection lost", { since: 500 });
+    await Promise.resolve();
+    const resumed = active()[0];
+    assert(resumed && resumed !== first);
+    expect(resumed.subjects).toEqual([alice.pubkey, bob.pubkey]);
+    expect(resumed.since).toBe(500);
+    // Nothing changed since the cursor: an empty resume keeps every name.
+    resumed.sink.eose();
+    expect(h.changed).not.toHaveBeenCalled();
+    expect(h.directory.snapshot()).toEqual(shown);
+    expect(h.directory.snapshot().get(bob.pubkey)?.status).toBe("checked");
+    // A changed head arrives; the omitted subject keeps its head and check.
+    resumed.sink.closed("disconnected: live connection lost", { since: 800 });
+    await Promise.resolve();
+    const next = active()[0];
+    assert(next && next !== resumed);
+    expect(next.since).toBe(800);
+    next.sink.event(projection(12));
+    next.sink.eose();
+    expect(h.changed).toHaveBeenCalledTimes(1);
+    expect(h.directory.snapshot().get(alice.pubkey)?.verifiedAt).toBe(12);
+    expect(h.directory.snapshot().get(bob.pubkey)).toEqual(
+      shown.get(bob.pubkey),
+    );
+    // A retraction is a newer head, so a resume still delivers it.
+    next.sink.event(retract(13, bob.pubkey));
+    expect(h.directory.snapshot().has(bob.pubkey)).toBe(false);
+  } finally {
+    h.directory.dispose();
+  }
+});
+
+it("keeps a resume's start point until a resumed batch reaches EOSE", async () => {
+  const h = harness();
+  const active = () => h.subscriptions.filter((item) => !item.stopped);
+  try {
+    h.directory.ensure([alice.pubkey]);
+    await Promise.resolve();
+    const first = active()[0];
+    assert(first);
+    first.sink.event(projection());
+    first.sink.eose();
+    first.sink.closed("disconnected: live connection lost", { since: 500 });
+    await Promise.resolve();
+    const resumed = active()[0];
+    assert(resumed);
+    // The next socket ends before this resume completes: no new cursor.
+    resumed.sink.closed("disconnected: live connection lost");
+    await Promise.resolve();
+    const again = active()[0];
+    assert(again && again !== resumed);
+    expect(again.since).toBe(500);
+  } finally {
+    h.directory.dispose();
+  }
+});
+
+it("replays in full a batch that had not reached EOSE or was rebuilt", async () => {
+  const h = harness();
+  const active = () => h.subscriptions.filter((item) => !item.stopped);
+  try {
+    h.directory.ensure([alice.pubkey]);
+    await Promise.resolve();
+    const first = active()[0];
+    assert(first);
+    // Not live yet: a cursor from the socket cannot cover this batch.
+    first.sink.closed("disconnected: live connection lost", { since: 500 });
+    await Promise.resolve();
+    const full = active()[0];
+    assert(full && full !== first);
+    expect(full.since).toBeUndefined();
+    full.sink.event(projection());
+    full.sink.eose();
+    full.sink.closed("disconnected: live connection lost", { since: 600 });
+    await Promise.resolve();
+    expect(active()[0]?.since).toBe(600);
+    // A new subject rebuilds the open batch, which needs every head again.
+    h.directory.ensure([bob.pubkey]);
+    await Promise.resolve();
+    const rebuilt = active()[0];
+    assert(rebuilt);
+    expect(rebuilt.subjects).toEqual([alice.pubkey, bob.pubkey]);
+    expect(rebuilt.since).toBeUndefined();
+  } finally {
+    h.directory.dispose();
   }
 });

@@ -59,6 +59,14 @@ pub(crate) struct Approval {
     pub scopes: Vec<String>,
 }
 
+impl Approval {
+    // New approvals grant full agent access only. Saved narrow approvals still load and renew, but
+    // grant no tools, so they never widen without new consent.
+    fn valid_scopes(&self) -> bool {
+        self.scopes == ["agent"]
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Grant {
@@ -246,11 +254,6 @@ fn load(account: &Path) -> Result<Option<Grant>, String> {
 fn save(account: &Path, grant: &Grant) -> Result<(), String> {
     let bytes =
         zeroize::Zeroizing::new(serde_json::to_vec(grant).map_err(|_| "Cannot encode pairing")?);
-    #[cfg(target_os = "macos")]
-    return security_framework::os::macos::keychain::SecKeychain::default()
-        .and_then(|keychain| keychain.set_generic_password(SERVICE, &account_id(account), &bytes))
-        .map_err(|_| "Cannot save the Buzz approval".into());
-    #[cfg(not(target_os = "macos"))]
     buzz_credential_store::replace(SERVICE, &account_id(account), &bytes)
         .map_err(|_| "Cannot save the Buzz approval".into())
 }
@@ -291,18 +294,7 @@ pub(super) fn authorize<R: tauri::Runtime>(
                 || !pubkey(&approval.viewer)
                 || approval.agent.len() > 600
                 || !approval.agent.get(..64).is_some_and(pubkey)
-                || approval.scopes.is_empty()
-                || approval.scopes.len() > 2
-                || approval
-                    .scopes
-                    .iter()
-                    .any(|scope| scope != "read" && scope != "post")
-                || approval
-                    .scopes
-                    .iter()
-                    .collect::<std::collections::HashSet<_>>()
-                    .len()
-                    != approval.scopes.len()
+                || !approval.valid_scopes()
                 || url::Url::parse(&approval.community).is_err()
             {
                 return Err("Invalid Buzz approval".into());
@@ -415,6 +407,26 @@ pub(crate) async fn plugin_host_mcp_pairing<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_approvals_grant_only_full_agent_access() {
+        let mut approval = grant().approval;
+        approval.scopes = vec!["agent".into()];
+        assert!(approval.valid_scopes());
+        for scopes in [
+            vec![],
+            vec!["read"],
+            vec!["read", "post"],
+            vec!["create"],
+            vec!["read", "post", "create"],
+            vec!["agent", "read"],
+            vec!["agent", "agent"],
+            vec!["manage"],
+        ] {
+            approval.scopes = scopes.iter().map(|scope| (*scope).into()).collect();
+            assert!(!approval.valid_scopes(), "{scopes:?}");
+        }
+    }
 
     fn grant() -> Grant {
         Grant {

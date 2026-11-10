@@ -14,8 +14,13 @@ import {
   subscribeLegacyImport,
 } from "../communities/legacy-communities";
 import type { CommunityReader, Membership } from "../communities/service";
+import { coversCommunity } from "../federated-identity/community-hosts";
+import {
+  signInServers,
+  type SessionSnapshot,
+} from "../federated-identity/service";
 import type { BackupStatus } from "./backup";
-import { hostedByThisBuilderlab } from "./builderlab-hosted";
+import { builderlabCommunityHosts } from "./builderlab-hosted";
 import type { BackupChoice, Identity } from "./service";
 
 /**
@@ -28,7 +33,7 @@ export function decideBackup(
   status: BackupStatus | undefined,
   choice: Pick<BackupChoice, "automatic">,
   memberships: readonly Pick<Membership, "id">[],
-  build?: string,
+  hosts: readonly string[] | undefined,
 ): "save" | "ask" | undefined {
   if (
     status?.status !== "waiting" ||
@@ -37,13 +42,14 @@ export function decideBackup(
     choice.automatic !== null
   )
     return undefined;
-  return memberships.some(({ id }) => hosted(id, build)) ? "save" : "ask";
+  return memberships.some(({ id }) => hosted(id, hosts)) ? "save" : "ask";
 }
 
 /** By the saved relay host alone: no relay is read for its NIP-11 `self`. */
-function hosted(id: string, build?: string) {
+function hosted(id: string, hosts: readonly string[] | undefined) {
+  if (!hosts) return false;
   try {
-    return hostedByThisBuilderlab({ url: communityDestination(id).url }, build);
+    return coversCommunity(hosts, communityDestination(id).url);
   } catch {
     return false;
   }
@@ -62,14 +68,21 @@ let answering = 0;
  * are offered or added, which the app starts once launch ends, so the prompt
  * never opens over that dialog and decides with the communities it adds.
  * Closing the prompt saves nothing and keeps it closed until Builderlab signs
- * out or the app next starts.
+ * out or the app next starts. While it is `paused` behind another prompt,
+ * nothing is decided or asked either.
  */
 export function BackupConsent({
   identity,
   communities,
+  servers = signInServers,
+  paused = false,
 }: {
   identity: Identity;
   communities: Pick<CommunityReader, "snapshot" | "subscribe">;
+  /** The build's sign-in servers, for which communities its Builderlab hosts. */
+  servers?: () => Promise<readonly SessionSnapshot[]>;
+  /** Another prompt is open, which this one waits behind. */
+  paused?: boolean;
 }) {
   const status = useSyncExternalStore(
     identity.backup.subscribe,
@@ -80,7 +93,7 @@ export function BackupConsent({
     subscribeLegacyImport,
     legacyImportPending,
   );
-  const held = launching || importing;
+  const held = launching || importing || paused;
   const [asking, setAsking] = useState<string>();
   const dismissed = useRef(false);
   const waiting =
@@ -106,13 +119,17 @@ export function BackupConsent({
       const { memberships } = client;
       if (client.status !== "ready" || memberships === latest) return;
       latest = memberships;
-      identity.getBackupChoice().then(
-        (choice) => {
+      Promise.all([
+        identity.getBackupChoice(),
+        builderlabCommunityHosts(servers),
+      ]).then(
+        ([choice, hosts]) => {
           if (memberships !== latest) return;
           const decision = decideBackup(
             identity.backup.snapshot(),
             choice,
             memberships,
+            hosts,
           );
           if (decision === "save") {
             // The user's own answer, still being saved, stands; the next
@@ -135,7 +152,7 @@ export function BackupConsent({
       latest = undefined;
       stop();
     };
-  }, [identity, communities, waiting, held]);
+  }, [identity, communities, servers, waiting, held]);
   if (!asking || held) return null;
   return (
     <BackupPrompt
@@ -150,8 +167,8 @@ export function BackupConsent({
 }
 
 /**
- * Asks whether to sync this device's identity with Builderlab. Sync with
- * Builderlab and I will manage my own key save the answer for `pubkey` and
+ * Asks whether to back up this device's key. Back up key and I will manage
+ * my own key save the answer for `pubkey` and
  * close with it; Close and Escape save nothing. A refused save stays in the
  * dialog. Once `ended`, it closes as Close does unless its own answer is
  * still being saved or was refused.
@@ -172,6 +189,7 @@ export function BackupPrompt({
 }) {
   const [saving, setSaving] = useState<boolean>();
   const [error, setError] = useState<string>();
+  const sync = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (ended && saving === undefined && error === undefined) onClose();
   }, [ended, saving, error, onClose]);
@@ -198,9 +216,10 @@ export function BackupPrompt({
   };
   return (
     <AlertDialog
-      title="Sync your identity with Builderlab?"
+      title="Back up your key?"
       description="Buzz will save an encrypted copy of your identity key with your Builderlab account. That copy can restore your identity, including in other apps where you use the same key."
       onClose={onClose}
+      initialFocus={sync}
       finalFocus={finalFocus}
       pending={saving !== undefined}
       actions={
@@ -214,13 +233,14 @@ export function BackupPrompt({
             I will manage my own key
           </Button>
           <Button
+            ref={sync}
             type="button"
             variant="prominent"
             disabled={saving === false}
             loading={saving === true}
             onClick={() => answer(true)}
           >
-            Sync with Builderlab
+            Back up key
           </Button>
         </>
       }

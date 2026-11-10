@@ -28,6 +28,8 @@ export type FakeTurn = {
 export type FakeGoose = {
   id: string;
   options: HostProcessOptions;
+  /** The agent its credential was bound to, if any. */
+  actedAs?: Readonly<{ pubkey: string; relay: string }>;
   /** Every message written to its stdin. */
   received: Message[];
   /** Each `session/new`'s params. */
@@ -72,6 +74,8 @@ export type FakeSession = Readonly<{
   cwd: string;
   updatedAt: string;
   conversation: readonly Record<string, unknown>[];
+  /** The tags it was opened with, which `session/list` filters by. */
+  tags?: Readonly<Record<string, string>>;
 }>;
 
 /** A loopback MCP server `serve` started, as the app's host would. */
@@ -113,9 +117,13 @@ export function fakeSpawn(
     /** Requests each process never answers. */
     silent?: readonly string[];
     /** The thinking levels a session lists on each model, `""` being the
-     * one it opens on; one not here lists none. */
+     * one it opens on; one not here lists none. `grouped` lists them in one
+     * ACP option group. */
     thinking?: Readonly<
-      Record<string, Readonly<{ current: string; levels: readonly string[] }>>
+      Record<
+        string,
+        Readonly<{ current: string; levels: readonly string[]; grouped?: true }>
+      >
     >;
   }> = {},
 ) {
@@ -168,19 +176,21 @@ export function fakeSpawn(
     const models = new Map<string, string>();
     const configOptions = (sessionId: string) => {
       const thinking = options.thinking?.[models.get(sessionId) ?? ""];
-      return thinking
-        ? [
-            {
-              id: "thinking_effort",
-              category: "thought_level",
-              currentValue: thinking.current,
-              options: thinking.levels.map((level) => ({
-                value: level,
-                name: level,
-              })),
-            },
-          ]
-        : [];
+      if (!thinking) return [];
+      const levels = thinking.levels.map((level) => ({
+        value: level,
+        name: level,
+      }));
+      return [
+        {
+          id: "thinking_effort",
+          category: "thought_level",
+          currentValue: thinking.current,
+          options: thinking.grouped
+            ? [{ group: "levels", name: "Levels", options: levels }]
+            : levels,
+        },
+      ];
     };
     const answers = new Map<number | string, (message: Message) => void>();
     const send = (message: Message) =>
@@ -252,7 +262,10 @@ export function fakeSpawn(
       const sessionId = String(params.sessionId ?? "");
       switch (method) {
         case "_buzz/security/capabilities":
-          return reply(id, { version: 2 });
+          return reply(id, {
+            version: 2,
+            enabled: fake.env.BUZZ_SECURITY_URL != null,
+          });
         case "initialize":
           return reply(id, {
             protocolVersion: 1,
@@ -400,14 +413,15 @@ export function fakeSpawn(
             models: options.supported ?? [],
           });
         case "session/list": {
-          const query = String(
-            (params._meta as { query?: string } | undefined)?.query ?? "",
-          );
-          const mentions = (session: FakeSession) =>
-            JSON.stringify(session.conversation).includes(query);
+          const tags = (params._meta as { tags?: Record<string, string> })
+            ?.tags;
+          // A session carries every tag asked for, as goose's index filters.
           const listed = (options.history ?? []).filter(
             (session) =>
-              session.cwd === params.cwd && (!query || mentions(session)),
+              session.cwd === params.cwd &&
+              Object.entries(tags ?? {}).every(
+                ([key, value]) => session.tags?.[key] === value,
+              ),
           );
           const from = Number(params.cursor ?? 0);
           const to = from + (options.page ?? listed.length);
@@ -469,6 +483,11 @@ export function fakeSpawn(
         fake.killed = true;
         fake.exit(null);
       },
+      ...(process.agentCredential && {
+        actAs: async (agent: Readonly<{ pubkey: string; relay: string }>) => {
+          fake.actedAs = agent;
+        },
+      }),
       exited,
     };
   };

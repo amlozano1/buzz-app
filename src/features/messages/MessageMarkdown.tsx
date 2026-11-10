@@ -22,21 +22,14 @@ import {
   channelForLink,
   channelLinkLabel,
   emptyReferenceDirectory,
+  MentionLabel,
 } from "./ReferenceText";
-import {
-  AtIcon,
-  CopyIcon,
-  RobotIcon,
-} from "../../shared/design-system/icons/index";
+import { CopyIcon } from "../../shared/design-system/icons/index";
 import { IconButton } from "../../shared/design-system/ui/IconButton";
 import { useToastNotification } from "../../shared/design-system/ui/Toast";
 import { profileKey } from "../profiles/target";
 import referenceStyles from "../../shared/InlineReference.module.css";
-import Markdown, {
-  type Components,
-  type ExtraProps,
-  type UrlTransform,
-} from "react-markdown";
+import Markdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import { remarkSpoilers } from "./remark-spoilers";
@@ -55,9 +48,11 @@ import type { ChannelMessage, Profile } from "../relay/contracts";
 import { emojiMatches, linkPart, messageParts } from "../relay/emoji";
 import { safeLinkUrl, visibleHtmlSource } from "../relay/message-content";
 import styles from "./Messages.module.css";
-import { profileMentionParts } from "./profile-mentions";
+import { profileMentionNames, profileMentionParts } from "./profile-mentions";
 import {
   isLiteralMarkdownContext,
+  isPlainProse,
+  plainProseTree,
   prepareMarkdown,
   type LiteralRange,
   type PreparedMarkdown,
@@ -240,7 +235,10 @@ function inlineProtectionKey(
   agents: typeof emptyReferenceDirectory.agents,
 ) {
   const identities = [...row.mentions, ...(row.mentionReferences ?? [])];
-  const mentions = identities.map((id) => [id, profiles?.get(id)?.name]);
+  const mentions = identities.map((id) => [
+    id,
+    ...profileMentionNames(profiles?.get(id)),
+  ]);
   const mentioned = new Set(identities);
   const agentNames = agents
     .filter((agent) => mentioned.has(agent.pubkey))
@@ -308,7 +306,35 @@ type HtmlNode = {
   tagName?: string;
   properties?: Record<string, unknown>;
   children?: HtmlNode[];
+  value?: string;
 };
+const blockTags = new Set([
+  ...["p", "ul", "ol", "li", "blockquote", "pre", "hr", "section"],
+  ...["table", "h1", "h2", "h3", "h4", "h5", "h6"],
+]);
+const isBlock = (node: HtmlNode | undefined) =>
+  node?.type === "root" || blockTags.has(node?.tagName ?? "");
+/** Bodies keep authored spaces (`white-space: pre-wrap`), so drop the newlines
+ * the renderer writes only as markup: between blocks and after a `<br>`. */
+function rehypeMarkupNewlines() {
+  return function visit(node: HtmlNode) {
+    const children = node.children;
+    if (!children) return;
+    node.children = children.flatMap((child, index) => {
+      if (child.type !== "text") {
+        visit(child);
+        return [child];
+      }
+      const before = index ? children[index - 1] : node;
+      const after = children[index + 1] ?? node;
+      let value = child.value ?? "";
+      if (before?.tagName === "br" || isBlock(before))
+        value = value.replace(/^\n/, "");
+      if (isBlock(after)) value = value.replace(/\n$/, "");
+      return value ? [{ ...child, value }] : [];
+    });
+  };
+}
 /** Lists and quotes the slot descends into, so their last line keeps it. */
 const editedSlotContainers = new Set(["ul", "ol", "li", "blockquote"]);
 /** Leave a slot after the body's last rendered line for the edited marker:
@@ -338,6 +364,33 @@ function rehypeEditedSlot() {
         children: [],
       },
     ];
+  };
+}
+
+/** GFM ends a bare URL only at whitespace. End it where bare message links end;
+ * `<url>` and `[url](url)` keep their destination. */
+function remarkBareLinkEnd(content: string) {
+  return function visit(parent: MarkdownNode) {
+    if (!parent.children) return;
+    parent.children = parent.children.flatMap((child) => {
+      const text = child.url;
+      const { start, end } = child.position ?? {};
+      if (
+        child.type !== "link" ||
+        !text ||
+        child.children?.[0]?.value !== text ||
+        (start && content.slice(start.offset, end?.offset) !== text)
+      ) {
+        visit(child);
+        return [child];
+      }
+      const parts = messageLinkParts(text).filter((part) => part.text);
+      if (parts.length < 2) return [child];
+      return parts.map(({ text: value, url }) => {
+        const node = { type: "text", value };
+        return url ? { type: "link", url, children: [node] } : node;
+      });
+    });
   };
 }
 
@@ -410,9 +463,6 @@ function remarkInlineContent(protectedContent: ProtectedContent) {
     visit(tree);
   };
 }
-
-const transformUrl: UrlTransform = (value) =>
-  parseBuzzLink(value) || profileKey(value) ? value : safeLinkUrl(value);
 
 type MessageComponents = {
   [Tag in "p" | "a" | "img" | "span" | "pre"]: (
@@ -563,6 +613,7 @@ function PreparedMessageMarkdown({
         directoryLabel={channelLinkLabel(url, directory.channels)}
         registry={extensions?.links}
         onOpenLink={onOpenLink}
+        canOpenLink={canOpenLink}
         session={session}
         scope={scope}
         interactive={interactive}
@@ -659,7 +710,6 @@ function PreparedMessageMarkdown({
       interactive && typeof target === "string" && !!canOpenLink?.(target);
     if (typeof text === "string" && typeof target === "string") {
       const label = key ? resolveName(key, text.slice(1)) : text.slice(1);
-      const Icon = agent ? RobotIcon : AtIcon;
       const Mention = clickable ? "button" : "span";
       // Selection copy reads the identity and the whole label (selection-copy.ts).
       return (
@@ -680,43 +730,32 @@ function PreparedMessageMarkdown({
               : undefined
           }
         >
-          <Icon aria-hidden="true" className={referenceStyles.icon} />
-          {label}
+          <MentionLabel agent={!!agent} label={label} />
         </Mention>
       );
     }
     return undefined;
   };
   const components: MessageComponents = {
-    p: ({ node, ...props }) => {
-      const first = node?.children[0];
-      const element = first?.type === "element" ? first : undefined;
-      const href = element?.properties.href;
-      const leadingMention =
-        typeof element?.properties["data-profile-target"] === "string" ||
-        (element?.tagName === "a" &&
-          typeof href === "string" &&
-          !!profileKey(href) &&
-          interactive &&
-          !!canOpenLink?.(href));
-      return (
-        <p
-          {...props}
-          className={largeEmoji ? styles.text : undefined}
-          data-single-emoji={largeEmoji || undefined}
-          data-leading-mention={leadingMention || undefined}
-        />
-      );
-    },
-    a: ({ href, children }) => {
+    p: ({ node: _node, ...props }) => (
+      <p
+        {...props}
+        className={largeEmoji ? styles.text : undefined}
+        data-single-emoji={largeEmoji || undefined}
+      />
+    ),
+    a: ({ href: target, children }) => {
+      const href =
+        target &&
+        (parseBuzzLink(target) ||
+        profileKey(target) ||
+        (interactive &&
+          !/^(?:https?|buzz|nostr):/i.test(target) &&
+          canOpenLink?.(target))
+          ? target
+          : safeLinkUrl(target));
       if (href && profileKey(href)) {
         const label = labelText(children);
-        if (!interactive || !canOpenLink?.(href))
-          return (
-            <span>
-              {children} ({href})
-            </span>
-          );
         return renderProfile(label.startsWith("@") ? label : `@${label}`, href);
       }
       return href ? (
@@ -839,6 +878,11 @@ const parsedBodies = recentResults<ReactElement>(
   (key, body) => 2 + elementCount(body) + Math.ceil(key.length / 500),
 );
 
+/** Plain prose skips micromark: the same tree, then the same plugins. */
+function remarkPlainProse(this: { parser?: unknown }) {
+  this.parser = plainProseTree;
+}
+
 const MarkdownBody = memo(function MarkdownBody({
   protectedContent,
 }: {
@@ -854,16 +898,22 @@ const MarkdownBody = memo(function MarkdownBody({
     () =>
       Markdown({
         remarkPlugins: [
+          // Protection only inserts placeholders isPlainProse rejects, so this
+          // agrees with prepareMarkdown's check on the raw content.
+          ...(isPlainProse(protectedContent.content) ? [remarkPlainProse] : []),
           remarkGfm,
+          [remarkBareLinkEnd, protectedContent.content],
           remarkBreaks,
           [remarkSpoilers, `<${protectedContent.prefix}spoiler\uE002>`],
           [remarkInlineContent, protectedContent],
           remarkLiteralHtml,
         ],
-        rehypePlugins: [rehypeEditedSlot],
+        rehypePlugins: [rehypeMarkupNewlines, rehypeEditedSlot],
         components: markdownComponents,
         skipHtml: true,
-        urlTransform: transformUrl,
+        // The live anchor renderer validates URLs. Cached parsing cannot decide
+        // whether a panel contribution is still registered.
+        urlTransform: (value) => value,
         children: protectedContent.content,
       }),
   );

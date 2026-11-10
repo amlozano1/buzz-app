@@ -94,3 +94,24 @@ it("sends only editable profile fields to the host-owned publisher", async () =>
     profile,
   );
 });
+it.each([408, 429, 500, 502, 503])(
+  "preserves retryable HTTP %s and its broker message",
+  async (status) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url.endsWith("/register")
+          ? Response.json({})
+          : Response.json({ error: "Relay unavailable" }, { status }),
+      ),
+    );
+    await expect(
+      communityRequest("https://unvisited.example", "info"),
+    ).rejects.toMatchObject({
+      name: "ReadError",
+      kind: "unavailable",
+      status,
+      message: "Relay unavailable",
+    });
+  },
+);

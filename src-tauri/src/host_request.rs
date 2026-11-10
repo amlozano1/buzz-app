@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::{Mutex, OnceLock};
 
+mod public_image;
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CallContext {
@@ -139,9 +141,9 @@ const MAX_HEADER_BYTES: usize = 8192;
 const MAX_RESPONSE_HEADER_BYTES: usize = 16 * 1024;
 pub(crate) const DEADLINE: Duration = Duration::from_secs(30);
 /// An uploaded file, such as an app artifact.
-const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 /// A deploy can wait for its rollout before it answers.
-const UPLOAD_DEADLINE: Duration = Duration::from_secs(180);
+pub(crate) const UPLOAD_DEADLINE: Duration = Duration::from_secs(180);
 /// What an uploaded file's name must end with: archives only, never a key or
 /// a config file a request could carry off.
 const UPLOAD_EXTENSION: &str = ".tar.gz";
@@ -183,7 +185,7 @@ impl HostRequest {
     }
 }
 
-fn request_deadline(timeout_ms: Option<u64>) -> Result<Duration, String> {
+pub(crate) fn request_deadline(timeout_ms: Option<u64>) -> Result<Duration, String> {
     match timeout_ms {
         None => Ok(DEADLINE),
         Some(value @ 1..=180_000) => Ok(Duration::from_millis(value)),
@@ -370,7 +372,7 @@ pub(crate) async fn plugin_host_upload_bytes_once<R: tauri::Runtime>(
         // One FIFO queue and work permit for GET/save/upload; queue time is part
         // of this call's entry deadline. Do not clone/build multipart while waiting.
         let _place = crate::host_files::byte_admission(deadline).await?;
-        byte_origin(manager, &id, &revision, &url).await?;
+        upload_origin(&byte_grants(manager, &id, &revision).await?, &url)?;
         calls.consume(
             webview.label(),
             "upload-bytes",
@@ -449,12 +451,28 @@ pub(crate) async fn plugin_host_request_bytes(
     let end = entered + Duration::from_millis(timeout);
     let operation = async {
         let _place = crate::host_files::byte_admission(end).await?;
-        byte_origin(manager.clone(), &id, &revision, &url).await?;
-        let get = client(false)?
-            .get(url.clone())
-            .timeout(Duration::from_millis(timeout));
-        let (status, headers, bytes) = read_bytes(get, request.max_bytes).await?;
-        byte_origin(manager, &id, &revision, &url).await?;
+        let reach = byte_origin(manager.clone(), &id, &revision, &url).await?;
+        let (status, headers, bytes) = match reach {
+            ByteReach::Declared => {
+                let get = client(false)?
+                    .get(url.clone())
+                    .timeout(Duration::from_millis(timeout));
+                read_bytes(get, request.max_bytes).await?
+            }
+            ByteReach::PublicImage => {
+                let addresses = public_image::public_addresses(&url).await?;
+                public_image::fetch(
+                    url.clone(),
+                    &addresses,
+                    request.max_bytes,
+                    Duration::from_millis(timeout),
+                )
+                .await?
+            }
+        };
+        if byte_origin(manager, &id, &revision, &url).await? != reach {
+            return Err("Host request origin is not declared".into());
+        }
         byte_frame(status, headers, bytes).map(tauri::ipc::Response::new)
     };
     tokio::time::timeout_at(end, operation)
@@ -462,20 +480,52 @@ pub(crate) async fn plugin_host_request_bytes(
         .map_err(|_| "Host byte request timed out")?
 }
 
+/// How a byte request may reach its URL: a declared origin gets any response;
+/// any other origin, with `host.publicImages`, gets only a public image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteReach {
+    Declared,
+    PublicImage,
+}
+
+async fn byte_grants(
+    manager: tauri::State<'_, PluginManager>,
+    id: &str,
+    revision: &str,
+) -> Result<HostGrants, String> {
+    let (id, revision) = (id.to_owned(), revision.to_owned());
+    with_manager(manager, move |m| m.host_grants(&id, &revision))
+        .await
+        .map_err(|_| "Host byte request is unavailable".into())
+}
+
 async fn byte_origin(
     manager: tauri::State<'_, PluginManager>,
     id: &str,
     revision: &str,
     url: &reqwest::Url,
-) -> Result<(), String> {
-    let (id, revision) = (id.to_owned(), revision.to_owned());
-    let grants = with_manager(manager, move |m| m.host_grants(&id, &revision))
-        .await
-        .map_err(|_| "Host byte request is unavailable")?;
-    if !allows_origin(&grants, url) {
-        return Err("Host request origin is not declared".into());
+) -> Result<ByteReach, String> {
+    let grants = byte_grants(manager, id, revision).await?;
+    reach(&grants, url).ok_or_else(|| "Host request origin is not declared".into())
+}
+
+/// An upload sends the plugin's bytes and returns the whole reply, so it
+/// needs a declared origin: `host.publicImages` widens only image reads.
+fn upload_origin(grants: &HostGrants, url: &reqwest::Url) -> Result<(), String> {
+    match reach(grants, url) {
+        Some(ByteReach::Declared) => Ok(()),
+        _ => Err("Host request origin is not declared".into()),
     }
-    Ok(())
+}
+
+fn reach(grants: &HostGrants, url: &reqwest::Url) -> Option<ByteReach> {
+    if allows_origin(grants, url) {
+        Some(ByteReach::Declared)
+    } else if grants.public_images {
+        Some(ByteReach::PublicImage)
+    } else {
+        None
+    }
 }
 
 fn byte_frame(
@@ -548,8 +598,8 @@ pub(crate) async fn plugin_host_upload(
         .map_err(|_| "Host upload timed out")?
 }
 
-/// `path` when it is an absolute `.tar.gz` regular file, not a link, in
-/// `home`, and small enough to upload.
+/// `path` when files and `url`'s origin are granted and it is an archive
+/// [`archive_path`] accepts.
 fn upload_path(
     grants: &HostGrants,
     url: &reqwest::Url,
@@ -562,6 +612,15 @@ fn upload_path(
     if !allows_origin(grants, url) {
         return Err("Host request origin is not declared".into());
     }
+    archive_path(path, home)
+}
+
+/// `path` when it is an absolute `.tar.gz` regular file, not a link, in
+/// `home`, and small enough to upload.
+pub(crate) fn archive_path(
+    path: &str,
+    home: Option<&std::path::Path>,
+) -> Result<std::path::PathBuf, String> {
     let invalid = || format!("An upload is a {UPLOAD_EXTENSION} file in your home directory");
     let path = std::path::Path::new(path);
     let home = home
@@ -609,7 +668,7 @@ fn validate_form(
     Ok(())
 }
 
-fn multipart(
+pub(crate) fn multipart(
     fields: &BTreeMap<String, String>,
     field: &str,
     name: &str,
@@ -740,7 +799,7 @@ async fn send_request_with_policy(
 /// connections instead of building a client and opening a connection on every
 /// call. Each request sets its own timeout. A protected request is never
 /// retried or pooled.
-fn client(protected: bool) -> Result<&'static reqwest::Client, String> {
+pub(crate) fn client(protected: bool) -> Result<&'static reqwest::Client, String> {
     static PLAIN: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
     static PROTECTED: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
     let cell = if protected { &PROTECTED } else { &PLAIN };
@@ -763,7 +822,9 @@ fn client(protected: bool) -> Result<&'static reqwest::Client, String> {
 }
 
 /// Sends `request` and reads its bounded response, without its cookies.
-async fn read_response(request: reqwest::RequestBuilder) -> Result<HostResponse, String> {
+pub(crate) async fn read_response(
+    request: reqwest::RequestBuilder,
+) -> Result<HostResponse, String> {
     let (status, headers, bytes) = read_bytes(request, MAX_RESPONSE_BYTES).await?;
     let body = String::from_utf8(bytes).map_err(|_| "Host response is not UTF-8")?;
     Ok(HostResponse {
@@ -811,6 +872,51 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[test]
+    fn a_declared_origin_keeps_its_reach_and_public_images_cover_the_rest() {
+        let url = |raw| reqwest::Url::parse(raw).unwrap();
+        let mut grants = HostGrants {
+            network_origins: vec!["https://api.example.com".into()],
+            ..HostGrants::default()
+        };
+        assert_eq!(
+            reach(&grants, &url("https://api.example.com/a")),
+            Some(ByteReach::Declared)
+        );
+        assert_eq!(reach(&grants, &url("https://cdn.example.org/a.png")), None);
+        grants.public_images = true;
+        assert_eq!(
+            reach(&grants, &url("https://api.example.com/a")),
+            Some(ByteReach::Declared)
+        );
+        assert_eq!(
+            reach(&grants, &url("https://cdn.example.org/a.png")),
+            Some(ByteReach::PublicImage)
+        );
+    }
+
+    #[test]
+    fn public_images_never_authorize_an_upload() {
+        let url = |raw| reqwest::Url::parse(raw).unwrap();
+        let images_only = HostGrants {
+            public_images: true,
+            ..HostGrants::default()
+        };
+        for target in [
+            "https://cdn.example.org/a.png",
+            "https://internal.example:8443/api",
+        ] {
+            assert!(upload_origin(&images_only, &url(target)).is_err());
+        }
+        let declared = HostGrants {
+            network_origins: vec!["https://api.example.com".into()],
+            public_images: true,
+            ..HostGrants::default()
+        };
+        assert!(upload_origin(&declared, &url("https://api.example.com/upload")).is_ok());
+        assert!(upload_origin(&declared, &url("https://cdn.example.org/upload")).is_err());
+    }
 
     fn local_response(response: Vec<u8>) -> (reqwest::Url, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -906,64 +1012,17 @@ mod tests {
     }
 
     #[test]
-    fn bundled_builderlab_uses_native_grants_for_exact_request_origins() {
+    fn bundled_builderlab_has_no_renderer_network_or_files() {
         let temp = tempfile::tempdir().unwrap();
         let manager =
             buzzodz_plugins::Manager::open(Some(temp.path().into()), "test", false).unwrap();
         let grants = manager.host_grants("block.builderlab", "bundled").unwrap();
-        if option_env!("BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG").is_some_and(|c| !c.is_empty()) {
-            // FI builds reach Builderlab only through the native forwarder.
-            assert!(grants
-                .federated_identity
-                .is_some_and(|grant| !grant.operations.is_empty()));
-            assert!(!grants.files && grants.network_origins.is_empty());
-            return;
-        }
-        assert!(grants.federated_identity.is_none());
+        // Builderlab is reached only through the native FI forwarder.
+        assert!(!grants.files && grants.network_origins.is_empty());
         assert_eq!(
-            grants.files,
-            buzzodz_plugins::apps_control_plane(buzzodz_plugins::BUILDERLAB_ORIGIN).is_some()
+            grants.federated_identity.is_some(),
+            option_env!("BUZZ_BUILD_FEDERATED_IDENTITY_CONFIG").is_some_and(|c| !c.is_empty())
         );
-        if let Some(origin) =
-            buzzodz_plugins::apps_control_plane(buzzodz_plugins::BUILDERLAB_ORIGIN)
-        {
-            let home = temp.path().canonicalize().unwrap();
-            let archive = home.join("app.tar.gz");
-            std::fs::write(&archive, b"gz").unwrap();
-            assert_eq!(
-                upload_path(
-                    &grants,
-                    &reqwest::Url::parse(origin).unwrap(),
-                    archive.to_str().unwrap(),
-                    Some(&home)
-                )
-                .unwrap(),
-                archive
-            );
-        }
-        let origin = grants
-            .network_origins
-            .first()
-            .map(String::as_str)
-            .unwrap_or("https://app.builderlab.xyz");
-        let (url, _, _) = validate_request(&request(&format!(
-            "{origin}/api/goose/v1/auth/login/exchange"
-        )))
-        .unwrap();
-        assert_eq!(
-            allows_origin(&grants, &url),
-            !grants.network_origins.is_empty()
-        );
-        let mut other = url;
-        other
-            .set_port(Some(if other.port() == Some(8443) {
-                9443
-            } else {
-                8443
-            }))
-            .unwrap();
-        let (url, _, _) = validate_request(&request(other.as_str())).unwrap();
-        assert!(!allows_origin(&grants, &url));
     }
 
     #[test]

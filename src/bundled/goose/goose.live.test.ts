@@ -24,6 +24,7 @@ import {
   type ToolServer,
 } from "./goose";
 import { GooseSetup } from "./setup";
+import { GooseHistory, sessionTags } from "./transcript";
 
 const BIN = process.env.GOOSE_ACP_BIN;
 
@@ -293,6 +294,51 @@ describe.skipIf(!BIN)("goose-acp", () => {
     }
   });
 
+  it("finds a conversation's session by the tags it opened with", {
+    timeout: 180_000,
+  }, async () => {
+    const { goose, cwd, tools } = await live();
+    const agent = "a".repeat(64);
+    const place = { channelId: "chan", root: "b".repeat(64) };
+    try {
+      const session = await goose.open({
+        cwd,
+        title: "Ada · #general · bbbbbbbb",
+        tools,
+        systemPrompt: "",
+        tags: sessionTags(agent, `${place.channelId}/${place.root}`),
+      });
+      // goose lists only sessions with messages.
+      expect(
+        await session.send("Reply with the single word ok."),
+      ).toMatchObject({
+        ok: true,
+      });
+      await goose.close(session);
+      const history = new GooseHistory({
+        spawn,
+        resolveDirectory: async (path) => path.replace(/^~/, homedir()),
+      });
+      const signal = new AbortController().signal;
+      // No saved id goose still has: the tags find it.
+      const read = await history.transcript(
+        { agent, workspace: cwd, place, sessions: ["gone"] },
+        signal,
+      );
+      expect(read?.turns.map((turn) => turn.sessionId)).toEqual([session.id]);
+      // Another thread, and another agent, find nothing.
+      for (const lookup of [
+        { agent, place: { ...place, root: "c".repeat(64) } },
+        { agent: "d".repeat(64), place },
+      ])
+        expect(
+          await history.transcript({ ...lookup, workspace: cwd }, signal),
+        ).toBeUndefined();
+    } finally {
+      await goose.kill();
+    }
+  });
+
   it("steers a message into the running turn", {
     timeout: 180_000,
   }, async () => {
@@ -378,6 +424,37 @@ describe.skipIf(!BIN)("goose-acp", () => {
         session.send("Reply in Buzz with the word again."),
       ).resolves.toEqual({ ok: true });
       expect(sends().at(-1)?.arguments?.text?.toLowerCase()).toContain("again");
+    } finally {
+      await goose.kill();
+    }
+  });
+
+  it("ends the turn after a final send, keeping the send's result", {
+    timeout: 180_000,
+  }, async () => {
+    const { goose, cwd, tools, sends } = await live();
+    const cancels: unknown[] = [];
+    const notify = goose.notify.bind(goose);
+    goose.notify = (method, params) => {
+      if (method === "session/cancel") cancels.push(params);
+      return notify(method, params);
+    };
+    try {
+      const session = await goose.open({
+        cwd,
+        tools,
+        systemPrompt:
+          "You are a Buzz agent. You reply in Buzz only by calling the send tool, once, with final true.",
+      });
+      await session.send("Reply in Buzz with the word hello.");
+      await session.idle();
+      expect(cancels).toEqual([{ sessionId: session.id }]);
+      // goose saved the send's result, not an interrupted call.
+      await session.send(
+        "Reply in Buzz with the exact text your last send tool call returned, or the word interrupted if it did not complete.",
+      );
+      await session.idle();
+      expect(sends().at(-1)?.arguments?.text).toContain("Sent.");
     } finally {
       await goose.kill();
     }

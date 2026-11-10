@@ -6,17 +6,19 @@ use archive::relay_archive;
 mod browser;
 #[cfg(target_os = "macos")]
 mod close_menu;
+mod credential_service;
 mod oauth_callback;
-use oauth_callback::{
-    oauth_callback_begin, oauth_callback_cancel, oauth_callback_complete, oauth_callback_wait,
-    OAuthCallbackHost,
-};
+use oauth_callback::OAuthCallbackHost;
 #[cfg(test)]
 mod browser_permissions_tests;
 mod pairing;
+mod qr;
+#[cfg(unix)]
+mod quit_signal;
+mod sharing;
 use browser::{
     browser_action, browser_attach, browser_detach, browser_navigate, browser_set_bounds,
-    browser_status,
+    browser_set_media_suspended, browser_status,
 };
 mod agent_state;
 mod app_agents;
@@ -41,32 +43,39 @@ mod host_files;
 mod host_mcp;
 mod host_process;
 mod host_request;
+mod mesh_compute;
+use mesh_compute::MeshHost;
 mod identity;
 mod native_mcp;
 mod nsec_backup;
 mod nsec_backup_choice;
 mod nsec_backup_config;
 use nsec_backup::{
-    nsec_backup_available, nsec_backup_retry, nsec_backup_session, nsec_backup_state,
-    nsec_backup_watch, nsec_restore_begin, nsec_restore_cancel, nsec_restore_install,
-    nsec_restore_wait, NsecBackupHost,
+    nsec_backup_available, nsec_backup_confirmed, nsec_backup_retry, nsec_backup_session,
+    nsec_backup_state, nsec_backup_watch, nsec_restore_begin, nsec_restore_cancel,
+    nsec_restore_install, nsec_restore_wait, NsecBackupHost,
 };
 use nsec_backup_choice::{nsec_backup_choice, nsec_backup_set_choice};
+mod claude_key;
 mod clipboard;
 mod jev;
 mod keep_awake;
 #[cfg(target_os = "macos")]
 mod legacy_cli_shortcut;
 mod legacy_communities;
+mod loopback;
 #[cfg(target_os = "macos")]
 mod media_context_menu;
 #[cfg(any(not(target_os = "macos"), test))]
 mod microphone;
 #[cfg(target_os = "macos")]
 mod mouse_nav;
+#[cfg(target_os = "macos")]
+mod reshow;
 
 mod notifications;
 mod os_idle;
+mod plugin_url;
 mod repositories_folder;
 mod window_controls;
 mod window_state;
@@ -117,7 +126,8 @@ use host_mcp::{
     plugin_host_mcp_reply, plugin_host_mcp_serve, HostMcpServers,
 };
 use host_process::{
-    plugin_host_process_kill, plugin_host_process_spawn, plugin_host_process_write, HostProcesses,
+    plugin_host_process_bind_agent, plugin_host_process_kill, plugin_host_process_spawn,
+    plugin_host_process_tool_credential, plugin_host_process_write, HostProcesses,
 };
 use host_request::{
     plugin_host_call_context, plugin_host_request, plugin_host_request_bytes, plugin_host_upload,
@@ -473,6 +483,31 @@ async fn plugin_import_git(
     .await
 }
 
+#[tauri::command]
+async fn plugin_import_url(
+    imports: tauri::State<'_, Imports>,
+    url: String,
+    sha256: String,
+) -> Result<Option<Preview>, String> {
+    let download = plugin_url::download(url.clone());
+    import_url(imports.inner().clone(), url, sha256, download).await
+}
+
+// Downloads while holding the import slot, as a Git clone does, so a review the
+// user closed can't finish later and replace a newer import's preview.
+async fn import_url(
+    imports: Imports,
+    url: String,
+    sha256: String,
+    download: impl std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static,
+) -> Result<Option<Preview>, String> {
+    prepare_import(imports, move || {
+        let bytes = tauri::async_runtime::block_on(download)?;
+        buzzodz_plugins::imports::prepare_url(&url, &sha256, bytes).map(Some)
+    })
+    .await
+}
+
 /// Admits a Git import's response; only a refused Add clears the preview it stored.
 async fn admit_git_result(
     fi: &federated_identity::FederatedIdentity,
@@ -647,6 +682,11 @@ async fn update_restart<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(
 }
 fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
+        credential_service::credential_pair_answer,
+        credential_service::credential_pairing_communities,
+        credential_service::credential_pair_prompt,
+        credential_service::credential_pairings_list,
+        credential_service::credential_pairing_revoke,
         window_state::onboarding_preserve_window,
         huddle_window_reset_incoming,
         huddle_window_open,
@@ -663,6 +703,8 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         pairing::pairing_confirm,
         pairing::pairing_deny,
         pairing::pairing_cancel,
+        qr::qr_code,
+        sharing::share_image,
         identity_restore,
         identity_import,
         identity_legacy_available,
@@ -674,6 +716,8 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         identity_prepare_remote_agent_authorization,
         identity_sign_builderlab_binding,
         federated_identity::federated_identity_snapshot,
+        federated_identity::federated_identity_servers,
+        federated_identity::federated_identity_requires,
         federated_identity::federated_identity_sign_in,
         federated_identity::federated_identity_cancel_sign_in,
         federated_identity::federated_identity_sign_out,
@@ -733,6 +777,7 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         plugin_update_check,
         plugin_update_preview,
         plugin_import_git,
+        plugin_import_url,
         plugin_import_install,
         plugin_import_discard,
         plugin_catalog,
@@ -749,6 +794,8 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         plugin_host_delete_managed_file,
         plugin_host_upload,
         plugin_host_process_spawn,
+        plugin_host_process_bind_agent,
+        plugin_host_process_tool_credential,
         plugin_host_process_write,
         plugin_host_process_kill,
         plugin_host_mcp_serve,
@@ -758,11 +805,8 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         plugin_host_mcp_close,
         plugin_host_read_file,
         plugin_host_resolve_directory,
-        oauth_callback_begin,
-        oauth_callback_wait,
-        oauth_callback_cancel,
-        oauth_callback_complete,
         nsec_backup_available,
+        nsec_backup_confirmed,
         nsec_backup_session,
         nsec_backup_retry,
         nsec_backup_state,
@@ -798,6 +842,8 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
         app_agents::app_agent_remember,
         app_agents::app_agent_claim,
         app_agents::app_agent_release,
+        claude_key::claude_api_key_status,
+        claude_key::claude_api_key_set,
         jev::jev_classifier_status,
         jev::jev_classifier_set_key,
         jev::jev_classifier_clear_key,
@@ -829,6 +875,7 @@ fn commands<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Sen
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    credential_service::drop_inherited();
     let context = app_context();
     // Reject unsafe test launch settings before any identity or pending erase work.
     let native_mcp = native_mcp::plugin(
@@ -916,17 +963,22 @@ pub fn run() {
                 if let Some(settings) = gtk::Settings::default() {
                     settings.set_gtk_xft_hintstyle(Some("hintslight"));
                 }
-                // WebKitGTK hides `navigator.mediaDevices` unless media streams are on.
+                // WebKitGTK hides `navigator.mediaDevices` unless media streams are
+                // on, and `RTCPeerConnection` (agent voice) unless WebRTC is.
                 if let Some(main) = app.get_webview_window("main") {
                     main.with_webview(|webview| {
                         use webkit2gtk::{SettingsExt, WebViewExt};
                         if let Some(settings) = webview.inner().settings() {
                             settings.set_enable_media_stream(true);
+                            settings.set_enable_webrtc(true);
                         }
                     })?;
                 }
             }
+            #[cfg(unix)]
+            quit_signal::install(app.handle());
             relay::set_user_agent(&app.package_info().version);
+            relay::watch_refusals(app.handle().clone());
             app.state::<federated_identity::FederatedIdentity>()
                 .watch(app.handle().clone());
             if let Some(window) = app.get_webview_window("main") {
@@ -939,6 +991,8 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             mouse_nav::install(app.handle());
             #[cfg(target_os = "macos")]
+            reshow::install(app.handle());
+            #[cfg(target_os = "macos")]
             if let Some(home) = dirs::home_dir() {
                 if let Err(error) = legacy_cli_shortcut::remove_stale(&home.join(".local/bin")) {
                     eprintln!("Could not remove old Buzz's CLI shortcut: {error}");
@@ -946,6 +1000,7 @@ pub fn run() {
             }
             tauri::async_runtime::spawn(host_command::load_login_shell_path());
             deep_links::setup(app.handle());
+            mesh_compute::setup(app.handle());
             app.manage(relay::Spools::new(
                 app.path()
                     .app_cache_dir()
@@ -1025,7 +1080,7 @@ pub fn run() {
                     .clone(),
             );
             app.manage(tokens.clone());
-            app.manage(app_agents::AppAgentHost::new(
+            let agents = app_agents::AppAgentHost::new(
                 paths
                     .as_ref()
                     .map(|(_, agents, _)| agents.join("identities.json"))
@@ -1041,7 +1096,32 @@ pub fn run() {
                 // installed app.
                 !tauri::is_dev() && app.config().identifier == sign_out::legacy_identifier::CURRENT,
                 tokens,
-            ));
+            );
+            let notices = app.handle().clone();
+            let credentials = credential_service::CredentialService::new(
+                agents.clone(),
+                app.config().identifier.clone(),
+                app.state::<IdentityHost>().inner().clone(),
+                app.state::<federated_identity::FederatedIdentity>()
+                    .inner()
+                    .clone(),
+                credential_service::CredentialService::keychain(
+                    &app.config().identifier,
+                    &app.path()
+                        .app_data_dir()
+                        .unwrap_or_else(|_| std::env::temp_dir()),
+                ),
+                std::sync::Arc::new(move |notice| credential_notice(&notices, notice)),
+            );
+            credentials.watch_account();
+            let starting = credentials.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = starting.start().await {
+                    eprintln!("{error}");
+                }
+            });
+            app.manage(credentials);
+            app.manage(agents);
             Ok(())
         });
     #[cfg(not(target_os = "macos"))]
@@ -1077,10 +1157,13 @@ pub fn run() {
     };
     builder
         .manage(clipboard::Clipboard::default())
+        .manage(mesh_compute::identity(identity.clone()))
+        .manage(MeshHost::default())
         .manage(keep_awake::KeepAwake::default())
         .manage(identity)
         .manage(archive::ArchiveHost::default())
         .manage(jev::JevHost::new())
+        .manage(claude_key::ClaudeKey::new())
         .manage(decisions::DecisionsHost::new())
         .manage(pairing::Pairing::default())
         .manage(Huddles::default())
@@ -1106,13 +1189,18 @@ pub fn run() {
             let browser_commands: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
                 browser_attach,
                 browser_set_bounds,
+                browser_set_media_suspended,
                 browser_detach,
                 browser_navigate,
                 browser_action,
                 browser_status
             ];
+            let mesh_commands = mesh_compute::commands();
             // Browser embeds a real native view; existing commands also support MockRuntime.
             move |request: tauri::ipc::Invoke<tauri::Wry>| {
+                if request.message.command().starts_with("mesh_compute_") {
+                    return mesh_commands(request);
+                }
                 if request.message.command().starts_with("browser_") {
                     browser_commands(request)
                 } else {
@@ -1140,6 +1228,9 @@ pub fn run() {
                 webview.state::<HostProcesses>().stop_all();
                 webview.state::<HostMcpServers>().stop_all();
                 webview.state::<app_agents::AppAgentHost>().page_load();
+                if let Some(credentials) = webview.try_state::<credential_service::CredentialService>() {
+                    credentials.page_load();
+                }
             }
             browser::page_load(webview, payload);
         })
@@ -1153,6 +1244,8 @@ pub fn run() {
                     api.prevent_close();
                     if let Err(error) = window.hide() {
                         eprintln!("Could not close Buzz window: {error}");
+                    } else {
+                        reshow::closed();
                     }
                     return;
                 }
@@ -1170,13 +1263,44 @@ pub fn run() {
                 shut_down(app);
                 #[cfg(target_os = "macos")]
                 relaunch::on_exit(app);
+                // AppKit exits through libc exit(), whose C++ static destructors can
+                // abort in the embedded ggml/Metal runtime (block/buzz desktop
+                // `hard_exit_after_mesh_shutdown`). Only once Mesh has run.
+                #[cfg(target_os = "macos")]
+                if app.state::<MeshHost>().runtime_started() {
+                    // SAFETY: Buzz and Mesh shutdown have run; skip only global destructors.
+                    unsafe { libc::_exit(0) }
+                }
             }
         });
 }
 
+/// Tells the page about a pairing request, its end, or a change to the list.
+fn credential_notice<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    notice: credential_service::Notice,
+) {
+    use credential_service::Notice;
+    use tauri::Emitter;
+    let _ = match notice {
+        Notice::Ask(request) => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+            }
+            app.emit_to("main", "credential-pair-request", request)
+        }
+        Notice::Closed(id) => app.emit_to("main", "credential-pair-closed", id),
+        Notice::Changed => app.emit_to("main", "credential-pairings-changed", ()),
+    };
+}
+
 /// Best-effort native teardown when Buzz exits, from Quit or a fenced sign-out.
 pub(crate) fn shut_down<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    app.state::<MeshHost>().shutdown();
     app.state::<NsecBackupHost>().close();
+    if let Some(credentials) = app.try_state::<credential_service::CredentialService>() {
+        credentials.stop();
+    }
     app.state::<federated_identity::FederatedIdentity>().close();
     app.state::<federated_identity::access::Registrations>()
         .clear();
@@ -1201,6 +1325,71 @@ fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_url_download_holds_the_import_slot_until_it_settles() {
+        let imports = super::Imports::default();
+        let (release, gate) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let (started, downloading) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(super::import_url(
+            imports.clone(),
+            "https://plugins.example.org/a.json".into(),
+            "ab".repeat(32),
+            // The download runs inside the slot, so its start shows the slot
+            // is held. Polling the slot instead could take it at the moment the
+            // download tried to, and the download would then fail as busy.
+            async move {
+                let _ = started.send(());
+                gate.await.map_err(|e| e.to_string())
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), downloading)
+            .await
+            .expect("the download never took the import slot")
+            .expect("the import ended without starting its download");
+        let second = super::prepare_import(imports.clone(), || Ok(None)).await;
+        assert_eq!(
+            second.err().as_deref(),
+            Some("Another import is in progress")
+        );
+        release.send(b"{}".to_vec()).unwrap();
+        assert!(first.await.unwrap().is_err());
+        assert!(imports.0.lock().unwrap().is_none());
+        assert!(super::prepare_import(imports, || Ok(None))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Tauri refuses a registered command its app manifest does not list, so
+    /// every handler must be in `build.rs` and allowed by a capability.
+    #[test]
+    fn every_registered_command_is_listed_and_allowed() {
+        let lib = include_str!("lib.rs");
+        let start = lib.find("generate_handler![").unwrap();
+        // The macro's own closing line; a `#[cfg(…)]` inside it has a `]` too.
+        let handlers = &lib[start..][..lib[start..].find("\n    ]").unwrap()];
+        let manifest = include_str!("../build.rs");
+        let capabilities = [
+            include_str!("../capabilities/default.json"),
+            include_str!("../capabilities/desktop-window.json"),
+            include_str!("../capabilities/huddle.json"),
+        ]
+        .concat();
+        let commands = handlers["generate_handler![".len()..]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("#[") && !line.is_empty())
+            .map(|line| line.trim_end_matches(',').rsplit("::").next().unwrap());
+        for command in commands {
+            assert!(
+                manifest.contains(&format!("\"{command}\"")),
+                "{command} is not in build.rs"
+            );
+            let allow = format!("\"allow-{}\"", command.replace('_', "-"));
+            assert!(capabilities.contains(&allow), "{command} has no capability");
+        }
+    }
+
     use super::{
         title_bar_double_click_action, title_bar_fill_target, TitleBarDoubleClickAction,
         TitleBarFillFrame, TitleBarFrame,

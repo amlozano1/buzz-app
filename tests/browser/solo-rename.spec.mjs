@@ -1,5 +1,6 @@
 import { test, expect } from "./fixture.mjs";
 import { newChat } from "./navigation.mjs";
+import { animationsSettled } from "./animations.mjs";
 
 const alpha = "33333333-3333-4333-8333-333333333333";
 const beta = "44444444-4444-4444-8444-444444444444";
@@ -28,13 +29,7 @@ async function settledError(page) {
   await expect(alert).toBeVisible();
   // The Field error grows above Reload. Visibility alone admits a click while
   // its hit target is still moving; wait for the actual opening to finish.
-  await alert.evaluate((element) =>
-    Promise.all(
-      element.parentElement
-        .getAnimations({ subtree: true })
-        .map((animation) => animation.finished),
-    ),
-  );
+  await animationsSettled(alert.locator(".."), { subtree: true });
 }
 
 // These exercise native focus loss, actual drawer hit targets and signed live
@@ -283,6 +278,10 @@ test("narrow mouse double-click renames while single-click and keyboard still na
       }),
     )
     .toEqual({ status: "failed", aborted: true });
+  await page
+    .getByRole("navigation", { name: "Apps dock" })
+    .getByRole("tab", { name: "Messages", exact: true })
+    .click();
   await show.tap();
   await row(page, alpha).click();
   await page.clock.runFor(501);
@@ -524,14 +523,14 @@ test("composable rows retain narrow rename and immediate keyboard/touch activati
   await page.clock.runFor(500);
   await expect(composer(page)).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Beta", exact: true }),
+    page.getByRole("button", { name: "Share access to Beta", exact: true }),
   ).toBeVisible();
   await expect(sidebar(page)).not.toBeVisible();
   await page.clock.resume();
   await show.click();
   await regionRow(page, alpha).press("Enter");
   await expect(
-    page.getByRole("heading", { name: "Alpha", exact: true }),
+    page.getByRole("button", { name: "Share access to Alpha", exact: true }),
   ).toBeVisible();
   await expect(sidebar(page)).not.toBeVisible();
   await show.click();

@@ -33,6 +33,7 @@ import type { RelayData } from "../relay/service";
 import { threadReference } from "../relay/thread-reference";
 import { MemoryReads, READ_TIMEOUT_MS } from "./core-memory";
 import { wakeAnchor, wakeLands } from "./plugin-wake";
+import { readAuthorNames } from "./author-names";
 import { ownerCanvas, readProject } from "./project";
 
 /** Whether each thread is its own conversation, or the whole channel is one. */
@@ -222,8 +223,17 @@ export function harnessKit(sources: Sources): HarnessKit {
       const wake = trigger.type !== "mention" ? trigger : undefined;
       if (trigger.type === "mention") {
         // Only the owner or an attested sibling. Unlike the bundled harnesses,
-        // which kept relay workflow mentions for compatibility, no workflow check.
-        if (!(await fromOwner(trigger.event, agent.owner))) return undefined;
+        // which kept relay workflow mentions for compatibility, no workflow
+        // authority is given, so no workflow mention is delegated; the
+        // community still applies the build's workflow restriction.
+        if (
+          !(await fromOwner(trigger.event, agent.owner, {
+            agent: agent.pubkey,
+            authority: undefined,
+            community: sources.relay(agent.key)?.snapshot().origin,
+          }))
+        )
+          return undefined;
         signal.throwIfAborted();
       }
       const event =
@@ -354,7 +364,16 @@ export function harnessKit(sources: Sources): HarnessKit {
         (item) =>
           item.created_at > since && (!since || item.pubkey !== agent.pubkey),
       );
-      const project = (await reading)?.section;
+      const reads = ownerReads(sources.relay(agent.key), agent.pubkey);
+      const signingAuthority = reads?.workflowAuthority();
+      const [names, project] = await Promise.all([
+        readAuthorNames(
+          reads,
+          [event, ...unseen.slice(-CONTEXT_LIMIT)],
+          signingAuthority,
+        ),
+        reading.then((read) => read?.section),
+      ]);
       const text = turnPrompt({
         agent: agent.key,
         event,
@@ -365,6 +384,8 @@ export function harnessKit(sources: Sources): HarnessKit {
         ...(thread ? { thread } : {}),
         context: unseen,
         total: earlier.length + 1,
+        names,
+        ...(signingAuthority ? { signingAuthority } : {}),
         ...(project ? { project } : {}),
         ...(wake
           ? { wake: { ...wake, text: (await wakeText?.()) ?? wake.text } }

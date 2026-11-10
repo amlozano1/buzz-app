@@ -25,7 +25,29 @@ afterEach(() => {
 });
 
 const viewer = "ab".repeat(32);
-const PORTAL = "https://app.builderlab.xyz";
+/** bb-public's community hosts, as its compiled sign-in server lists them. */
+const PUBLIC_HOSTS = ["*.communities.buzz.xyz", "communities.buzz.xyz"];
+/** A build whose first compiled sign-in server is bb-public. */
+const publicServers = async () =>
+  [
+    {
+      status: "signed-out",
+      authority: {
+        id: "bb-public",
+        identityOrigin: "https://app.builderlab.xyz",
+        apiBasePath: "/api/goose/",
+        signIn: "on-demand",
+        organization: null,
+        communityHosts: PUBLIC_HOSTS,
+      },
+      revision: "",
+      email: null,
+      failure: null,
+      expiresAt: null,
+      expiring: false,
+      cleanup: false,
+    },
+  ] as const;
 const HOSTED = "https://communities.buzz.xyz";
 const INDEPENDENT = "https://relay.example.com";
 
@@ -52,19 +74,24 @@ it.each([
   "a key with no saved choice in %s decides %s",
   (_label, decision, ids) => {
     expect(
-      decideBackup(consent(), { automatic: null }, memberships(ids), PORTAL),
+      decideBackup(
+        consent(),
+        { automatic: null },
+        memberships(ids),
+        PUBLIC_HOSTS,
+      ),
     ).toBe(decision);
   },
 );
 
-it("a build that is not the hosting portal asks even for a hosted community", () => {
-  for (const build of ["https://builderlab.example", ""])
+it("a build whose Builderlab doesn't host a community asks even for a hosted one", () => {
+  for (const hosts of [["buzz.acme.builderlab.xyz"], [], undefined])
     expect(
       decideBackup(
         consent(),
         { automatic: null },
         memberships([HOSTED]),
-        build,
+        hosts,
       ),
     ).toBe("ask");
 });
@@ -88,7 +115,7 @@ it.each([
 ] as const)("%s decides nothing", (_label, status, automatic) => {
   for (const ids of [[HOSTED], [INDEPENDENT]])
     expect(
-      decideBackup(status, { automatic }, memberships(ids), PORTAL),
+      decideBackup(status, { automatic }, memberships(ids), PUBLIC_HOSTS),
     ).toBeUndefined();
 });
 
@@ -102,7 +129,6 @@ function setup(
   automatic: boolean | null = null,
   loading = false,
 ) {
-  vi.stubEnv("VITE_BUZZ_BUILDERLAB_URL", PORTAL);
   const watchers: { onmessage: (status: BackupStatus) => void }[] = [];
   const backup = createBackupStatus(
     async <T,>(command: string, args?: Record<string, unknown>) => {
@@ -157,6 +183,7 @@ function setup(
         { backup, getBackupChoice, setBackupChoice } as unknown as Identity
       }
       communities={communities}
+      servers={publicServers}
     />,
   );
   return {
@@ -221,7 +248,7 @@ it("a key in a hosted community is backed up with no prompt", async () => {
 });
 
 it.each([
-  ["Sync with Builderlab", true],
+  ["Back up key", true],
   ["I will manage my own key", false],
 ] as const)(
   "a key in only independent communities is asked, and %s saves its answer",
@@ -229,7 +256,7 @@ it.each([
     const app = setup(consent(), [INDEPENDENT]);
     const user = userEvent.setup();
     const dialog = await screen.findByRole("alertdialog", {
-      name: "Sync your identity with Builderlab?",
+      name: "Back up your key?",
     });
     expect(dialog).toHaveAccessibleDescription(
       "Buzz will save an encrypted copy of your identity key with your Builderlab account. That copy can restore your identity, including in other apps where you use the same key.",
@@ -484,16 +511,12 @@ it("a refused save stays in the prompt with its reason, and Escape then closes i
       onClose={onClose}
     />,
   );
-  await user.click(
-    await screen.findByRole("button", { name: "Sync with Builderlab" }),
-  );
+  await user.click(await screen.findByRole("button", { name: "Back up key" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Another backup of this key is in progress.",
   );
   expect(onClose).not.toHaveBeenCalled();
-  expect(
-    screen.getByRole("button", { name: "Sync with Builderlab" }),
-  ).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Back up key" })).toBeEnabled();
   await user.keyboard("{Escape}");
   expect(onClose).toHaveBeenCalledOnce();
   expect(setBackupChoice).toHaveBeenCalledOnce();

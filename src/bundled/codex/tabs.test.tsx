@@ -3,10 +3,12 @@ import { AgentTabs } from "../agents/AgentTabs";
 import type {
   Agent,
   Agents,
+  NewAgent,
   RegisteredAgentType,
 } from "../../features/agents/service";
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
+import { useState } from "react";
 import {
   act,
   cleanup,
@@ -27,6 +29,7 @@ import {
   type AgentStore,
 } from "../../features/agents/state";
 import type { AgentViewProps } from "../../features/agents/service";
+import { AgentCreateDialog } from "../agents/AgentCreateDialog";
 import type { HostProcessOptions } from "../../features/host/service";
 import type { ChannelSummary } from "../../features/relay/contracts";
 import type { RelayData } from "../../features/relay/service";
@@ -68,6 +71,8 @@ function fixture({
   turns = () => ({ result: { data: [] } }),
   threads = [],
   configured = {},
+  modelAReasoningEfforts = ["low", "high"],
+  modelBReasoningEfforts = ["medium"],
   storage = localStore(),
   channels = [{ id: "channel", name: "general" }],
   binding,
@@ -89,6 +94,8 @@ function fixture({
   turns?: (threadId: string) => Wire;
   threads?: { id: string; name: string; updatedAt: number }[] | string;
   configured?: { model?: string; model_reasoning_effort?: string };
+  modelAReasoningEfforts?: string[];
+  modelBReasoningEfforts?: string[];
 } = {}) {
   const processes: { end: ReturnType<typeof vi.fn> }[] = [];
   const items = new Map<string, unknown[]>();
@@ -172,10 +179,9 @@ function fixture({
                 description: "Model A description.",
                 isDefault: true,
                 defaultReasoningEffort: "low",
-                supportedReasoningEfforts: [
-                  { reasoningEffort: "low" },
-                  { reasoningEffort: "high" },
-                ],
+                supportedReasoningEfforts: modelAReasoningEfforts.map(
+                  (reasoningEffort) => ({ reasoningEffort }),
+                ),
               },
               {
                 id: "b",
@@ -183,7 +189,9 @@ function fixture({
                 displayName: "Model B",
                 description: "Model B description.",
                 defaultReasoningEffort: "medium",
-                supportedReasoningEfforts: [{ reasoningEffort: "medium" }],
+                supportedReasoningEfforts: modelBReasoningEfforts.map(
+                  (reasoningEffort) => ({ reasoningEffort }),
+                ),
               },
             ],
             nextCursor: null,
@@ -315,15 +323,21 @@ it("lists saved conversations and shows one's Codex thread, or that Codex no lon
     ] as HTMLElement;
   expect(await screen.findByTitle("general · thread eeeeeeee")).toBeVisible();
   fireEvent.click(viewButton(0));
-  expect(await screen.findByText("what changed?")).toBeVisible();
-  expect(screen.getByText("Two files.")).toBeVisible();
+  expect(
+    await screen.findByText("what changed?", { selector: "summary span" }),
+  ).toBeVisible();
+  expect(
+    screen.getByText("Two files.", { selector: "summary span" }),
+  ).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Refresh transcript" }));
   await waitFor(() =>
     expect(
       screen.getByRole("button", { name: "Refresh transcript" }),
     ).not.toHaveAttribute("data-loading"),
   );
-  expect(screen.getByText("Two files.")).toBeVisible();
+  expect(
+    screen.getByText("Two files.", { selector: "summary span" }),
+  ).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "Back to profile" }));
   fireEvent.click(viewButton(1));
   expect(
@@ -457,7 +471,9 @@ it("opens a channel's thread transcript when opened from one of its threads' act
       initialTranscript={{ opening: 1, done }}
     />,
   );
-  expect(await screen.findByText("Two files.")).toBeVisible();
+  expect(
+    await screen.findByText("Two files.", { selector: "summary span" }),
+  ).toBeVisible();
   expect(done).toHaveBeenCalledTimes(1);
 });
 
@@ -611,7 +627,9 @@ it("finds the thread's Codex session another build started", async () => {
   fireEvent.click(
     await within(opened).findByRole("button", { name: /^View transcript/ }),
   );
-  expect(await screen.findByText("what changed?")).toBeVisible();
+  expect(
+    await screen.findByText("what changed?", { selector: "summary span" }),
+  ).toBeVisible();
 });
 
 it("shows the channel's current kind for a session another build started", async () => {
@@ -1186,22 +1204,442 @@ it("starts a new agent from a model and instructions, keeping the rest", async (
   });
 });
 
+it("uses Codex's supported efforts at creation and reopens the saved choice", async () => {
+  const f = fixture();
+  const Thinking = f.tabs.CreateThinking;
+  if (!Thinking) throw new Error("Missing Thinking control");
+  const config = { ...defaults, model: "model-a", effort: "" };
+  const onChange = vi.fn();
+  const view = render(
+    <Thinking config={config} onChange={onChange} disabled={false} />,
+  );
+  const control = await screen.findByRole("combobox", { name: "Thinking" });
+  await waitFor(() => expect(control).toBeEnabled());
+  expect(control).toHaveTextContent("Low · Default");
+
+  const held = await holdSpawn(f);
+  const refresh = f.provider.check();
+  try {
+    await held.started;
+    expect(f.provider.snapshot()).toMatchObject({ checking: true });
+    expect(control).toBeDisabled();
+  } finally {
+    held.release();
+    await refresh;
+  }
+  await waitFor(() => expect(control).toBeEnabled());
+
+  const user = userEvent.setup();
+  await user.click(control);
+  expect(
+    (await screen.findAllByRole("option")).map((option) => option.textContent),
+  ).toEqual(["Low · Default", "Low", "High"]);
+  await user.click(screen.getByRole("option", { name: "High" }));
+  expect(onChange).toHaveBeenLastCalledWith({ ...config, effort: "high" });
+  view.unmount();
+
+  render(<f.tabs.SettingsTab {...f.props({ ...config, effort: "high" })} />);
+  expect(screen.getByRole("combobox", { name: "Thinking" })).toHaveTextContent(
+    "High",
+  );
+});
+
+it.each(["unrelated", "thinking", "model"])(
+  "preserves saved Codex Thinking through an update unless explicitly edited (%s)",
+  async (edit) => {
+    const f = fixture({ modelAReasoningEfforts: ["low"] });
+    await f.provider.check();
+    const registeredType = {
+      key: "buzz.codex/codex",
+      title: "Codex",
+      defaults: () => ({ config: { ...defaults } }),
+      Create: f.tabs.Create,
+      CreateModel: f.tabs.CreateModel,
+      CreateThinking: f.tabs.CreateThinking,
+    } as unknown as RegisteredAgentType;
+    const existing = {
+      ...f.props({ ...defaults, model: "model-a", effort: "high" }).agent,
+      type: registeredType.key,
+    };
+    const onSave = vi.fn(async (_input: NewAgent) => undefined);
+    render(
+      <AgentCreateDialog
+        agents={{} as Agents}
+        types={[registeredType]}
+        onCreated={vi.fn()}
+        onClose={vi.fn()}
+        update={{
+          agent: existing,
+          onSave,
+          request: {
+            id: "update",
+            requester: "requester",
+            requesterName: "Parent",
+            owner: existing.owner,
+            community: "here",
+            agent: existing.pubkey,
+            agentName: existing.name,
+            agentType: existing.type,
+            name: "Renamed",
+          },
+        }}
+      />,
+    );
+    const user = userEvent.setup();
+    const thinking = await screen.findByRole("combobox", { name: "Thinking" });
+    await waitFor(() => expect(thinking).toBeEnabled());
+    fireEvent.change(screen.getByLabelText(/Instructions/), {
+      target: { value: "Review PRs." },
+    });
+    if (edit === "thinking") {
+      await user.click(thinking);
+      await user.click(await screen.findByRole("option", { name: "Low" }));
+    } else if (edit === "model") {
+      await user.click(screen.getByRole("combobox", { name: "Model" }));
+      await user.click(await screen.findByRole("option", { name: "Model B" }));
+    }
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() =>
+      expect(onSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Renamed",
+          config: {
+            ...existing.config,
+            instructions: "Review PRs.",
+            model: edit === "model" ? "model-b" : "model-a",
+            effort:
+              edit === "thinking"
+                ? "low"
+                : edit === "model"
+                  ? "medium"
+                  : "high",
+          },
+        }),
+      ),
+    );
+  },
+);
+
+it("passes the real Codex Thinking choice through Create agent", async () => {
+  const f = fixture();
+  await f.provider.check();
+  const registeredType = {
+    key: "buzz.codex/codex",
+    pluginId: "buzz.codex",
+    revision: "r1",
+    title: "Codex",
+    defaults: () => ({ config: { ...defaults } }),
+    Create: f.tabs.Create,
+    CreateModel: f.tabs.CreateModel,
+    CreateThinking: f.tabs.CreateThinking,
+  } as unknown as RegisteredAgentType;
+  let saved: Agent<Config> | undefined;
+  const create = vi.fn(async (input: NewAgent) => {
+    saved = {
+      ...f.props({ ...defaults, ...(input.config as Config) }).agent,
+      name: input.name,
+      type: input.type,
+    };
+    return saved;
+  });
+  const view = render(
+    <AgentCreateDialog
+      agents={{ create } as unknown as Agents}
+      types={[registeredType]}
+      onCreated={vi.fn()}
+      onClose={vi.fn()}
+    />,
+  );
+  const dialog = screen.getByRole("dialog", { name: "Create agent" });
+  const user = userEvent.setup();
+  await user.type(within(dialog).getByLabelText("Name"), "Nova");
+
+  const thinking = within(dialog).getByRole("combobox", { name: "Thinking" });
+  await waitFor(() => expect(thinking).toBeEnabled());
+  expect(thinking).toHaveTextContent("Low · Default");
+  await user.click(thinking);
+  await user.click(await screen.findByRole("option", { name: "High" }));
+  await user.click(
+    within(dialog).getByRole("button", { name: "Create agent" }),
+  );
+
+  await waitFor(() => expect(create).toHaveBeenCalledOnce());
+  expect(create).toHaveBeenCalledWith(
+    expect.objectContaining({
+      type: "buzz.codex/codex",
+      config: expect.objectContaining({ model: "", effort: "high" }),
+    }),
+  );
+  expect(saved?.config).toMatchObject({ model: "", effort: "high" });
+
+  if (!saved) throw new Error("Agent was not saved");
+  view.unmount();
+  render(<f.tabs.SettingsTab {...f.props(saved.config)} />);
+  expect(screen.getByRole("combobox", { name: "Thinking" })).toHaveTextContent(
+    "High",
+  );
+});
+
+it("returns an unsupported Codex effort to Default after a successful catalog refresh", async () => {
+  const modelAReasoningEfforts = ["low", "high"];
+  const f = fixture({ modelAReasoningEfforts });
+  await f.provider.check();
+  const registeredType = {
+    key: "buzz.codex/codex",
+    pluginId: "buzz.codex",
+    revision: "r1",
+    title: "Codex",
+    defaults: () => ({ config: { ...defaults } }),
+    Create: f.tabs.Create,
+    CreateModel: f.tabs.CreateModel,
+    CreateThinking: f.tabs.CreateThinking,
+  } as unknown as RegisteredAgentType;
+  let saved: Agent<Config> | undefined;
+  const create = vi.fn(async (input: NewAgent) => {
+    saved = {
+      ...f.props({ ...defaults, ...(input.config as Config) }).agent,
+      name: input.name,
+      type: input.type,
+    };
+    return saved;
+  });
+  const view = render(
+    <AgentCreateDialog
+      agents={{ create } as unknown as Agents}
+      types={[registeredType]}
+      onCreated={vi.fn()}
+      onClose={vi.fn()}
+    />,
+  );
+  const dialog = screen.getByRole("dialog", { name: "Create agent" });
+  const user = userEvent.setup();
+  await user.type(within(dialog).getByLabelText("Name"), "Nova");
+  await user.type(
+    within(dialog).getByLabelText(/Instructions/),
+    "Keep the answer focused.",
+  );
+
+  const thinking = within(dialog).getByRole("combobox", { name: "Thinking" });
+  await waitFor(() => expect(thinking).toBeEnabled());
+  expect(thinking).toHaveTextContent("Low · Default");
+  await user.click(thinking);
+  await user.click(await screen.findByRole("option", { name: "High" }));
+  expect(thinking).toHaveTextContent("High");
+
+  modelAReasoningEfforts.splice(0, modelAReasoningEfforts.length, "low");
+  const held = await holdSpawn(f);
+  const refresh = f.provider.check();
+  try {
+    await held.started;
+    expect(thinking).toBeDisabled();
+    expect(thinking).toHaveTextContent("High");
+  } finally {
+    held.release();
+    await refresh;
+  }
+  await waitFor(() => expect(thinking).toHaveTextContent("Low · Default"));
+  await user.click(
+    within(dialog).getByRole("button", { name: "Create agent" }),
+  );
+
+  await waitFor(() => expect(create).toHaveBeenCalledOnce());
+  expect(create).toHaveBeenCalledWith(
+    expect.objectContaining({
+      type: "buzz.codex/codex",
+      config: expect.objectContaining({
+        model: "",
+        effort: "",
+        instructions: "Keep the answer focused.",
+      }),
+    }),
+  );
+  expect(saved?.config).toMatchObject({
+    model: "",
+    effort: "",
+    instructions: "Keep the answer focused.",
+  });
+
+  if (!saved) throw new Error("Agent was not saved");
+  view.unmount();
+  render(<f.tabs.SettingsTab {...f.props(saved.config as Config)} />);
+  await waitFor(() =>
+    expect(
+      screen.getByRole("combobox", { name: "Thinking" }),
+    ).toHaveTextContent("Low · Default"),
+  );
+});
+
+it.each([
+  {
+    catalog: ["medium"],
+    scenario: "only the new model default is supported",
+    expectedEffort: "medium",
+  },
+  {
+    catalog: ["medium", "high"],
+    scenario: "the previous value is also supported",
+    expectedEffort: "medium",
+  },
+  {
+    catalog: ["high"],
+    scenario: "the new model does not list its default effort",
+    expectedEffort: "",
+  },
+])(
+  "resets create-time Codex effort to the new model default when $scenario",
+  async ({ catalog, expectedEffort }) => {
+    const f = fixture({ modelBReasoningEfforts: catalog });
+    const Thinking = f.tabs.CreateThinking;
+    if (!Thinking) throw new Error("Missing Thinking control");
+    const changes: Config[] = [];
+    function CreateSettings() {
+      const [config, setConfig] = useState({ ...defaults, model: "model-a" });
+      const onChange = (next: Config) => {
+        changes.push(next);
+        setConfig(next);
+      };
+      return (
+        <>
+          <f.tabs.CreateModel
+            config={config}
+            onChange={onChange}
+            disabled={false}
+          />
+          <Thinking config={config} onChange={onChange} disabled={false} />
+        </>
+      );
+    }
+    render(<CreateSettings />);
+    const thinking = await screen.findByRole("combobox", { name: "Thinking" });
+    await waitFor(() => expect(thinking).toBeEnabled());
+
+    const user = userEvent.setup();
+    await user.click(thinking);
+    await user.click(await screen.findByRole("option", { name: "High" }));
+    await waitFor(() => expect(thinking).toHaveTextContent("High"));
+    await user.click(await screen.findByRole("combobox", { name: "Model" }));
+    await user.click(await screen.findByRole("option", { name: "Model B" }));
+
+    expect(changes).toContainEqual({
+      ...defaults,
+      model: "model-b",
+      effort: expectedEffort,
+    });
+    await waitFor(() =>
+      expect(changes.at(-1)).toEqual({
+        ...defaults,
+        model: "model-b",
+        effort: expectedEffort,
+      }),
+    );
+    expect(
+      screen.getByRole("combobox", { name: "Thinking" }),
+    ).toHaveTextContent(expectedEffort ? "Medium" : "Medium · Default");
+  },
+);
+
+it("returns create-time Codex effort to Default when the inherited model changes", async () => {
+  const f = fixture({ modelBReasoningEfforts: ["medium"] });
+  await f.provider.check();
+  const DefaultControl = f.tabs.DefaultControl;
+  const Thinking = f.tabs.CreateThinking;
+  if (!DefaultControl || !Thinking) throw new Error("Missing create controls");
+  const changes: Config[] = [];
+  function CreateSettings() {
+    const [config, setConfig] = useState({ ...defaults });
+    const onChange = (next: Config) => {
+      changes.push(next);
+      setConfig(next);
+    };
+    return (
+      <>
+        <DefaultControl onConfigure={vi.fn()} />
+        <Thinking config={config} onChange={onChange} disabled={false} />
+        <output data-testid="create-config">{JSON.stringify(config)}</output>
+      </>
+    );
+  }
+  render(<CreateSettings />);
+  const user = userEvent.setup();
+  const thinking = await screen.findByRole("combobox", { name: "Thinking" });
+  await waitFor(() => expect(thinking).toBeEnabled());
+  expect(thinking).toHaveTextContent("Low · Default");
+  await user.click(thinking);
+  await user.click(await screen.findByRole("option", { name: "High" }));
+
+  const providerModel = screen.getByRole("button", {
+    name: /^Codex default model:/,
+  });
+  await user.click(providerModel);
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Other" }));
+  fireEvent.click(
+    await screen.findByRole("menuitemradio", { name: "Model B" }),
+  );
+  fireEvent.click(await screen.findByRole("menuitemradio", { name: "Medium" }));
+
+  await waitFor(() => expect(providerModel).toHaveTextContent("Model B"));
+  await waitFor(() => expect(thinking).toHaveTextContent("Medium · Default"));
+  await waitFor(() =>
+    expect(changes.at(-1)).toEqual({ ...defaults, effort: "" }),
+  );
+  expect(
+    JSON.parse(screen.getByTestId("create-config").textContent ?? "null"),
+  ).toMatchObject({ model: "", effort: "" });
+});
+
 it("keeps a new agent on the default when the catalog fails", async () => {
   const f = fixture();
   f.spawn.mockRejectedValueOnce(new Error("no codex"));
   const onChange = vi.fn();
+  const Thinking = f.tabs.CreateThinking;
+  if (!Thinking) throw new Error("Missing Thinking control");
   render(
-    <f.tabs.CreateModel
-      config={{ ...defaults, effort: "high" }}
-      onChange={onChange}
-      disabled={false}
-    />,
+    <>
+      <f.tabs.CreateModel
+        config={defaults}
+        onChange={onChange}
+        disabled={false}
+      />
+      <Thinking config={defaults} onChange={onChange} disabled={false} />
+    </>,
   );
   await screen.findByRole("alert");
   expect(
     screen.queryByRole("option", { name: /Custom model/ }),
   ).not.toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Thinking" })).toBeDisabled();
   expect(onChange).not.toHaveBeenCalled();
+});
+
+it("preserves an explicit Codex effort when the catalog fails", async () => {
+  const f = fixture();
+  f.spawn.mockRejectedValueOnce(new Error("no codex"));
+  const config = { ...defaults, model: "model-a", effort: "high" };
+  const onChange = vi.fn();
+  const Thinking = f.tabs.CreateThinking;
+  if (!Thinking) throw new Error("Missing Thinking control");
+  const view = render(
+    <>
+      <f.tabs.CreateModel
+        config={config}
+        onChange={onChange}
+        disabled={false}
+      />
+      <Thinking config={config} onChange={onChange} disabled={false} />
+    </>,
+  );
+  const thinking = await screen.findByRole("combobox", { name: "Thinking" });
+  await screen.findByRole("alert");
+  expect(thinking).toBeDisabled();
+  expect(thinking).toHaveTextContent("High");
+  expect(thinking).not.toHaveTextContent("High (unavailable)");
+  expect(onChange).not.toHaveBeenCalled();
+
+  view.unmount();
+  render(<f.tabs.SettingsTab {...f.props({ ...defaults, effort: "high" })} />);
+  expect(screen.getByRole("combobox", { name: "Thinking" })).toHaveTextContent(
+    "High (unavailable)",
+  );
 });
 
 it("shows the default workspace and restores it when the field is cleared", async () => {
@@ -1405,8 +1843,12 @@ it("offers to install Codex from its card when Buzz has no copy", async () => {
       onChange={vi.fn()}
     />,
   );
-  fireEvent.click(await screen.findByRole("button", { name: "Install Codex" }));
-  const dialog = await screen.findByRole("dialog", { name: "Set up Codex" });
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Install integration" }),
+  );
+  const dialog = await screen.findByRole("dialog", {
+    name: "Codex integration",
+  });
   expect(within(dialog).getByText(/about 130 MB/)).toBeVisible();
   expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
   // A failed download leaves the offer in place, with what went wrong.
@@ -1417,7 +1859,7 @@ it("offers to install Codex from its card when Buzz has no copy", async () => {
     await within(dialog).findByRole("log", { name: "Setup output" }),
   ).toHaveTextContent("Codex downloads need the desktop app");
   expect(
-    await within(dialog).findByRole("button", { name: "Install Codex" }),
+    await within(dialog).findByRole("button", { name: "Install integration" }),
   ).toBeEnabled();
 
   f.disk.installed = true;
@@ -1428,7 +1870,7 @@ it("offers to install Codex from its card when Buzz has no copy", async () => {
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 });
 
-it("moves the card from Install Codex to Sign in once the install succeeds", async () => {
+it("moves the card from Install integration to Sign in once the install succeeds", async () => {
   const f = fixture({ installed: false, signedIn: false });
   // Stands in for the download, which setup.test.ts covers.
   const download = deferred<void>();
@@ -1446,9 +1888,15 @@ it("moves the card from Install Codex to Sign in once the install succeeds", asy
       onChange={vi.fn()}
     />,
   );
-  fireEvent.click(await screen.findByRole("button", { name: "Install Codex" }));
-  const dialog = await screen.findByRole("dialog", { name: "Set up Codex" });
-  const install = within(dialog).getByRole("button", { name: "Install Codex" });
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Install integration" }),
+  );
+  const dialog = await screen.findByRole("dialog", {
+    name: "Codex integration",
+  });
+  const install = within(dialog).getByRole("button", {
+    name: "Install integration",
+  });
   install.focus();
   expect(
     await within(dialog).findByRole("button", { name: "Cancel" }),
@@ -1509,20 +1957,20 @@ it("installs and signs in Buzz's copy of Codex from its provider settings", asyn
   );
   render(<ProviderDialogBody onClose={vi.fn()} />);
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Codex is not installed.",
+    "The Codex integration isn't installed yet.",
   );
   expect(provider.snapshot()).toMatchObject({
     readiness: "attention",
-    attentionLabel: "Install Codex",
+    attentionLabel: "Install Codex integration",
   });
   expect(screen.getByText(/about 130 MB/)).toBeVisible();
   // A failed download leaves the offer in place, with what went wrong.
-  fireEvent.click(screen.getByRole("button", { name: "Install Codex" }));
+  fireEvent.click(screen.getByRole("button", { name: "Install integration" }));
   expect(
     await screen.findByRole("log", { name: "Setup output" }),
   ).toHaveTextContent("Codex downloads need the desktop app");
   expect(
-    await screen.findByRole("button", { name: "Install Codex" }),
+    await screen.findByRole("button", { name: "Install integration" }),
   ).toBeVisible();
 
   f.disk.installed = true;
@@ -1543,37 +1991,6 @@ it("installs and signs in Buzz's copy of Codex from its provider settings", asyn
   expect(provider.snapshot()).toMatchObject({ readiness: "ready" });
   expect(provider.snapshot()).not.toHaveProperty("blocking");
   provider.dispose();
-});
-
-it("signs in again from provider settings once Codex is ready, for security reviews", async () => {
-  const f = fixture();
-  render(<f.tabs.ProviderDialogBody onClose={vi.fn()} />);
-  const again = await screen.findByRole("button", { name: "Sign in again" });
-  expect(f.provider.snapshot()).toMatchObject({ readiness: "ready" });
-  fireEvent.click(again);
-  expect(await screen.findByText("Waiting for Codex sign-in…")).toBeVisible();
-  expect(f.spawn.mock.calls.filter(([id]) => id === "login")).toHaveLength(1);
-  expect(again).toHaveAttribute("aria-busy", "true");
-
-  f.logins[0]?.resolve(0);
-  await waitFor(() => expect(again).not.toHaveAttribute("aria-busy", "true"));
-  expect(screen.queryByText("Waiting for Codex sign-in…")).toBeNull();
-  expect(f.provider.snapshot()).toMatchObject({ readiness: "ready" });
-});
-
-it("keeps a failed sign-in's output once Codex is ready", async () => {
-  const f = fixture();
-  render(<f.tabs.ProviderDialogBody onClose={vi.fn()} />);
-  const again = await screen.findByRole("button", { name: "Sign in again" });
-  fireEvent.click(again);
-  await waitFor(() => expect(f.logins).toHaveLength(1));
-  f.logins[0]?.resolve(1);
-  await waitFor(() => expect(again).not.toHaveAttribute("aria-busy", "true"));
-  expect(f.provider.snapshot()).toMatchObject({ readiness: "ready" });
-  expect(screen.getByRole("log", { name: "Setup output" })).toHaveTextContent(
-    "Sign-in ended (1).",
-  );
-  expect(screen.getByRole("log", { name: "Setup output" })).toBeVisible();
 });
 
 it("separates identity fields from runtime settings without changing the stored config", () => {
@@ -1842,7 +2259,7 @@ it("opens scoped model settings from a remote card when local Codex is unavailab
   );
   const control = await screen.findByRole("button", { name: "Model settings" });
   expect(control).toHaveTextContent("Codex default");
-  expect(screen.queryByText("Install Codex")).not.toBeInTheDocument();
+  expect(screen.queryByText("Install integration")).not.toBeInTheDocument();
   await userEvent.setup().click(control);
   expect(openSettings).toHaveBeenCalledOnce();
   expect(f.spawn).not.toHaveBeenCalled();
@@ -1864,7 +2281,7 @@ it("refreshes a mounted card after its agent receives an execution binding", asy
     openSettings,
   };
   const view = render(<tabs.CreateModel {...props} agent={agent} />);
-  await screen.findByRole("button", { name: "Install Codex" });
+  await screen.findByRole("button", { name: "Install integration" });
   f.spawn.mockClear();
   binding = { provider: "test/guest" };
   view.rerender(
@@ -1874,7 +2291,7 @@ it("refreshes a mounted card after its agent receives an execution binding", asy
     />,
   );
   try {
-    expect(screen.queryByText("Install Codex")).not.toBeInTheDocument();
+    expect(screen.queryByText("Install integration")).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "Model" })).toHaveTextContent(
       "Loading models",
     );
@@ -1883,7 +2300,7 @@ it("refreshes a mounted card after its agent receives an execution binding", asy
   }
   const control = await screen.findByRole("button", { name: "Model settings" });
   expect(control).toHaveTextContent("Codex default");
-  expect(screen.queryByText("Install Codex")).not.toBeInTheDocument();
+  expect(screen.queryByText("Install integration")).not.toBeInTheDocument();
   await userEvent.setup().click(control);
   expect(openSettings).toHaveBeenCalledOnce();
   expect(f.spawn).not.toHaveBeenCalled();
@@ -1914,6 +2331,42 @@ it("keeps a bound card focused through unrelated agent updates", async () => {
   expect(screen.getByRole("button", { name: "Model settings" })).toBe(control);
   expect(control).toHaveFocus();
   expect(inspect).toHaveBeenCalledOnce();
+});
+
+it("keeps update Thinking independent of local choices while resolving and using a target binding", async () => {
+  const inspection = deferred<AgentExecutionBinding | undefined>();
+  const f = fixture({ inspection: inspection.promise });
+  await f.provider.check();
+  await f.provider.saveDefaults({ model: "model-a", effort: "high" });
+  const onChange = vi.fn();
+  const props = {
+    agent: f.props().agent,
+    config: defaults,
+    disabled: false,
+    onChange,
+  };
+  const view = render(<f.tabs.CreateThinking {...props} />);
+  const thinking = screen.getByRole("combobox", { name: "Thinking" });
+  try {
+    expect(thinking).toBeDisabled();
+  } finally {
+    await act(async () => inspection.resolve({ provider: "test/guest" }));
+  }
+  expect(thinking).toBeDisabled();
+  expect(thinking).toHaveTextContent("Default");
+  expect(thinking).not.toHaveTextContent("High");
+  view.rerender(
+    <f.tabs.CreateThinking
+      {...props}
+      config={{ ...defaults, model: "model-a", effort: "high" }}
+    />,
+  );
+  const saved = screen.getByRole("combobox", { name: "Thinking" });
+  expect(saved).toBeDisabled();
+  expect(saved).toHaveTextContent("High");
+  await userEvent.setup().click(saved);
+  expect(screen.queryByRole("option")).not.toBeInTheDocument();
+  expect(onChange).not.toHaveBeenCalled();
 });
 
 it("keeps remote settings read-only without opening a model catalog", async () => {
@@ -2150,4 +2603,36 @@ it("keeps a later Activity read when an earlier closed tab finishes last", async
   expect(screen.queryByTitle("general · channel")).not.toBeInTheDocument();
   expect(f.runtime.conversations(agent)).toEqual([]);
   expect(f.spawn).not.toHaveBeenCalled();
+});
+
+it("reports Codex connection readiness only after resolving a model", async () => {
+  const f = fixture();
+  const onReadyChange = vi.fn();
+  const { rerender } = render(
+    <f.tabs.CreateModel
+      config={{ ...defaults, model: "missing-model" }}
+      onChange={vi.fn()}
+      onReadyChange={onReadyChange}
+      disabled={false}
+    />,
+  );
+  await act(async () => {
+    await f.provider.check();
+  });
+  expect(onReadyChange).toHaveBeenLastCalledWith(false);
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "This model isn’t available. Choose another model to continue.",
+  );
+  rerender(
+    <f.tabs.CreateModel
+      config={defaults}
+      onChange={vi.fn()}
+      onReadyChange={onReadyChange}
+      disabled={false}
+    />,
+  );
+  await waitFor(() => expect(onReadyChange).toHaveBeenLastCalledWith(true));
+  expect(
+    screen.queryByText(/This model isn’t available/),
+  ).not.toBeInTheDocument();
 });
