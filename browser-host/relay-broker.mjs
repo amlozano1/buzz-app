@@ -3333,7 +3333,7 @@ export function relayBrokerPlugin({
               });
             };
             if (profile) {
-              const current = await admittedApiRequest(
+              const current = await admittedRelayRequest(
                 lane,
                 () =>
                   request(

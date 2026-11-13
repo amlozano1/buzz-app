@@ -27,6 +27,7 @@ import {
   LIVE_CANVAS_BYTES,
 } from "../src/features/channel-templates/canvas-limits.ts";
 import { connectBrokerTransport } from "../src/features/relay/transport.ts";
+import * as httpAdmission from "../src/features/relay/http-admission.ts";
 import { createOutbox, PublishRejected } from "../src/features/relay/outbox.ts";
 import { createRelaySession } from "../src/features/relay/session.ts";
 import { feedbackEvent } from "../src/features/relay/product-feedback.ts";
@@ -2043,62 +2044,92 @@ test("query keeps relay 403 refusals but turns an edge 403 page into a gateway f
   }
 });
 
-test("a queued request's community refusal marks its own response", async () => {
-  // A held sidebar write and five held queries fill the community's six-slot
-  // lane. The next query waits and starts from whichever finishes first, so
-  // its refusal must mark its own response, not that one's.
-  const releases = new Map();
-  let holding = true;
-  const h = await harness(async (call, count, event) => {
-    const filter = call.body?.[0];
-    const sidebar = filter?.kinds?.[0] === 30078;
-    if (filter?.limit === 7)
-      return new Response("authorization denied\n", { status: 403 });
-    if (holding && call.url.endsWith("/query"))
-      await new Promise((resolve) =>
-        releases.set(sidebar ? "sidebar" : filter.limit, resolve),
-      );
-    if (sidebar) return Response.json([]);
-    if (call.url.endsWith("/events"))
-      return Response.json({ accepted: true, event_id: call.body.id });
-    return success(call, count, event);
-  });
-  const releaseAll = () => {
-    holding = false;
-    for (const release of releases.values()) release();
-  };
-  try {
-    const sidebar = h.post("sidebar-sort", {
-      group: "forums",
-      mode: "recent",
-      sectionIds: [],
+test.each(["query", "profile", "update", "clear"])(
+  "a queued %s request's community refusal marks its own response",
+  async (operation) => {
+    // A held sidebar write and five held queries fill the community's six-slot
+    // lane. The next request waits and starts from whichever finishes first, so
+    // its refusal must mark its own response, not that one's.
+    const releases = new Map();
+    let holding = true;
+    const createAdmission = vi.spyOn(httpAdmission, "createApiAdmission");
+    const key = new Uint8Array(32);
+    key[31] = 7;
+    const viewer = getPublicKey(key);
+    const profile = finalizeEvent(
+      { kind: 0, content: '{"name":"Sam"}', created_at: 1699999999, tags: [] },
+      key,
+    );
+    const h = await harness(async (call, count, event) => {
+      const filter = call.body?.[0];
+      const sidebar = filter?.kinds?.[0] === 30078;
+      if (
+        filter?.limit === 7 ||
+        (filter?.kinds?.[0] === 0 && filter?.authors?.[0] === viewer)
+      )
+        return new Response("authorization denied\n", { status: 403 });
+      if (holding && call.url.endsWith("/query"))
+        await new Promise((resolve) =>
+          releases.set(sidebar ? "sidebar" : filter.limit, resolve),
+        );
+      if (sidebar) return Response.json([]);
+      if (call.url.endsWith("/events"))
+        return Response.json({ accepted: true, event_id: call.body.id });
+      return success(call, count, event);
     });
-    await vi.waitFor(() => expect(releases.has("sidebar")).toBe(true));
-    const held = [1, 2, 3, 4, 5].map((limit) =>
-      h.post("query", [{ kinds: [0], limit }]),
-    );
-    await vi.waitFor(() => expect(releases.size).toBe(6));
-    const queued = h.post("query", [{ kinds: [0], limit: 7 }]);
-    await delay(20);
-    expect(h.calls).toHaveLength(6);
-    releases.get(1)();
-    const first = await held[0];
-    const refused = await queued;
-    expect(refused.status).toBe(403);
-    expect(refused.headers.get("x-buzz-refusal")).toBe("access");
-    expect(first.headers.get("x-buzz-refusal")).toBeNull();
-    await Promise.all([first.text(), refused.text()]);
-    releaseAll();
-    await Promise.all(
-      [sidebar, ...held.slice(1)].map(async (response) =>
-        (await response).text(),
-      ),
-    );
-  } finally {
-    releaseAll();
-    await h.close();
-  }
-});
+    const releaseAll = () => {
+      holding = false;
+      for (const release of releases.values()) release();
+    };
+    let sidebar, queued;
+    let held = [];
+    try {
+      sidebar = h.post("sidebar-sort", {
+        group: "forums",
+        mode: "recent",
+        sectionIds: [],
+      });
+      await vi.waitFor(() => expect(releases.has("sidebar")).toBe(true));
+      expect(createAdmission).toHaveBeenCalledTimes(1);
+      const run = vi.spyOn(createAdmission.mock.results[0].value, "run");
+      held = [1, 2, 3, 4, 5].map((limit) =>
+        h.post("query", [{ kinds: [0], limit }]),
+      );
+      await vi.waitFor(() => expect(releases.size).toBe(6));
+      queued =
+        operation === "query"
+          ? h.post("query", [{ kinds: [0], limit: 7 }])
+          : operation === "profile"
+            ? h.post("profile", { name: "Edited", picture: "" })
+            : h.post("receiving-address", {
+                address: operation === "clear" ? null : TEST_RECEIVING_ADDRESS,
+                profile,
+              });
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(6));
+      expect(h.calls).toHaveLength(6);
+      releases.get(1)();
+      const first = await held[0];
+      const refused = await queued;
+      expect(refused.status).toBe(403);
+      expect(refused.headers.get("x-buzz-refusal")).toBe("access");
+      expect(first.headers.get("x-buzz-refusal")).toBeNull();
+      expect(h.calls.some((call) => call.url.endsWith("/events"))).toBe(false);
+      await Promise.all([first.text(), refused.text()]);
+    } finally {
+      releaseAll();
+      try {
+        await Promise.all(
+          [sidebar, ...held, queued].filter(Boolean).map(async (pending) => {
+            const response = await pending;
+            if (!response.bodyUsed) await response.text();
+          }),
+        );
+      } finally {
+        await h.close();
+      }
+    }
+  },
+);
 
 test("Canvas sign and publish bound content and the complete signed event", async () => {
   const h = await harness((call) =>
